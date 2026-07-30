@@ -220,6 +220,13 @@ def speak():
             sit behind this wrapper without becoming controller-specific integrations.
           </p>
           <p>
+            This repository includes a Windows-native EchoTTS bridge under{' '}
+            <code className="bs-code-inline">tools/echo-tts</code>. Its setup and run
+            scripts keep Echo resident on a selected CUDA device, serialize synthesis,
+            load narrator references from a controlled voice directory, and return strict
+            PCM WAV responses for a controller running on another machine.
+          </p>
+          <p>
             Each chunk response must be an uncompressed PCM WAV (WAVE format 1), and
             every chunk in a chapter must use the same channel count, sample rate and bit
             depth so it can be joined without transcoding. Long-form rendering is
