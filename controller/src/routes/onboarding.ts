@@ -23,6 +23,7 @@ import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 
 import { requireAdmin } from '../middleware/auth.js';
 import { DEFAULT_LOCCA_BASE_URL, DEFAULT_REQUESTY_BASE_URL, OPENROUTER_APP_HEADERS, noThinkFetch } from '../llm/provider.js';
+import { LLM_ADMISSION_PRIORITY, withLlmAdmission } from '../llm/sdk.js';
 import * as settings from '../settings.js';
 import * as jingles from '../broadcast/jingles.js';
 import { queue } from '../broadcast/queue.js';
@@ -135,19 +136,27 @@ router.post('/onboarding/test-llm', requireAdmin, async (req, res) => {
       }
     }
 
-    const out = await generateText({
-      model: m,
-      prompt: 'Reply with the single word OK.',
-      // OpenAI's Responses API (the default path for createOpenAI()(model))
-      // rejects max_output_tokens below 16, so the probe budget must clear it.
-      maxOutputTokens: 32,
-      // A test must always answer. Without a bound an unreachable/stalled model
-      // hangs this handler forever, the wizard's fetch never resolves, and the
-      // button is stuck on "Asking…" with no feedback (issue #682). maxRetries:0
-      // so the operator sees the first real error fast instead of silent backoff.
-      maxRetries: 0,
-      abortSignal: AbortSignal.timeout(45_000),
-    });
+    const signal = AbortSignal.timeout(45_000);
+    const out = await withLlmAdmission(
+      {
+        kind: 'operator.onboarding-llm-probe',
+        priority: LLM_ADMISSION_PRIORITY.listener,
+        signal,
+      },
+      () => generateText({
+        model: m,
+        prompt: 'Reply with the single word OK.',
+        // OpenAI's Responses API (the default path for createOpenAI()(model))
+        // rejects max_output_tokens below 16, so the probe budget must clear it.
+        maxOutputTokens: 32,
+        // A test must always answer. Without a bound an unreachable/stalled model
+        // hangs this handler forever, the wizard's fetch never resolves, and the
+        // button is stuck on "Asking…" with no feedback (issue #682). maxRetries:0
+        // so the operator sees the first real error fast instead of silent backoff.
+        maxRetries: 0,
+        abortSignal: signal,
+      }),
+    );
     res.json({ ok: true, sample: (out.text || '').trim().slice(0, 60) });
   } catch (err: any) {
     res.json({ ok: false, error: err.message || 'LLM call failed' });

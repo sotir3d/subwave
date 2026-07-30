@@ -56,6 +56,7 @@ export function duplicateAction(entry: string): 'copy' | 'backup' | 'skip' {
 // install-level entries stay at the root (spec §2).
 const INSTALL_LEVEL = new Set([
   'stations', 'icecast-secrets.env', 'hf-cache', 'analyze-tmp', 'lost+found',
+  'llm-admission.lock', 'llm-admission.reaper.lock',
 ]);
 
 export function conversionAction(entry: string): 'move' | 'keep' {

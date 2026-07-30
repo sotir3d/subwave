@@ -28,8 +28,13 @@ const TAVILY_ENDPOINT = 'https://api.tavily.com/search';
 const DDG_ENDPOINT = 'https://api.duckduckgo.com/';
 const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
 
-type SearchResult = { title: string; content: string };
-type SearchResponse = { answer: string; results: SearchResult[] };
+export type SearchResult = {
+  title: string;
+  content: string;
+  url?: string;
+  publishedAt?: string;
+};
+export type SearchResponse = { answer: string; results: SearchResult[] };
 
 // 30-min TTL cache keyed by `${provider}:${query}`. Same shape as music/picker.js
 // — Map + { val, at }, no LRU eviction (search queries are bounded by the
@@ -71,9 +76,11 @@ export async function tavilySearch(query: string): Promise<SearchResponse> {
   return {
     answer: String(data.answer || '').trim(),
     results: Array.isArray(data.results)
-      ? data.results.map((r: any) => ({
+        ? data.results.map((r: any) => ({
           title: String(r.title || ''),
           content: String(r.content || ''),
+          ...(r.url ? { url: String(r.url) } : {}),
+          ...(r.published_date ? { publishedAt: String(r.published_date) } : {}),
         }))
       : [],
   };
@@ -122,6 +129,7 @@ export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
           results.push({
             title: String(sub.Name || data.Heading || ''),
             content: sub.Text.trim(),
+            ...(sub.FirstURL ? { url: String(sub.FirstURL) } : {}),
           });
         }
         if (results.length >= 5) break;
@@ -130,6 +138,7 @@ export async function duckduckgoSearch(query: string): Promise<SearchResponse> {
       results.push({
         title: String(t.Name || data.Heading || ''),
         content: t.Text.trim(),
+        ...(t.FirstURL ? { url: String(t.FirstURL) } : {}),
       });
     }
     if (results.length >= 5) break;
@@ -189,7 +198,15 @@ export function parseSearxngResponse(data: unknown): SearchResponse {
     const title = typeof rec.title === 'string' ? rec.title.trim() : '';
     const content = typeof rec.content === 'string' ? rec.content.trim().slice(0, 300) : '';
     if (!title || !content) continue;
-    results.push({ title, content });
+    const url = typeof rec.url === 'string' ? rec.url.trim() : '';
+    const publishedAt = typeof rec.publishedDate === 'string'
+      ? rec.publishedDate.trim()
+      : typeof rec.published_date === 'string' ? rec.published_date.trim() : '';
+    results.push({
+      title, content,
+      ...(url ? { url } : {}),
+      ...(publishedAt ? { publishedAt } : {}),
+    });
     if (results.length >= 10) break;
   }
 
@@ -275,7 +292,15 @@ export function parseBraveResponse(data: unknown): SearchResponse {
     const title = braveText(rec.title);
     const content = braveText(rec.description).slice(0, 300);
     if (!title || !content) return;
-    results.push({ title, content });
+    const url = typeof rec.url === 'string' ? rec.url.trim() : '';
+    const publishedAt = typeof rec.age === 'string'
+      ? rec.age.trim()
+      : typeof rec.page_age === 'string' ? rec.page_age.trim() : '';
+    results.push({
+      title, content,
+      ...(url ? { url } : {}),
+      ...(publishedAt ? { publishedAt } : {}),
+    });
   };
   const newsResults = sub(d.news, 'results');
   const webResults = sub(d.web, 'results');

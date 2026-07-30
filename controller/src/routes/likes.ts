@@ -58,7 +58,10 @@ function checkLikeLimit(ip: string): { ok: boolean; retryAfter?: number } {
 async function currentLikeable() {
   const np = await queue.getNowPlaying();
   const songId = np?.subsonic_id ? String(np.subsonic_id) : '';
-  if (!songId) return null;
+  // Timeline speech carries a synthetic `talk:` id solely so Liquidsoap can
+  // remove it from request.queue. It is not a Navidrome song and must never
+  // reach either the station-like store or Subsonic's star endpoint.
+  if (!songId || np?.subwave_kind === 'talk' || songId.startsWith('talk:')) return null;
   const queueTrack = (queue as any).current?.track;
   const track = queueTrack?.id === songId
     ? queueTrack

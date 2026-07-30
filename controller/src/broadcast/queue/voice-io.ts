@@ -97,6 +97,29 @@ export async function airVoice(path: string, wavPath: string, text: string, gain
   return turn;
 }
 
+// Timeline speech must begin only after any already-handed-off overlay has
+// cleared. The long-form runtime acquires its exclusive mic lease before it
+// calls this, so no new autonomous voice can extend the chain behind us.
+export async function waitForVoiceIdle(signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    await _voiceChain.catch(() => undefined);
+    return;
+  }
+  const abortError = () => {
+    if (signal.reason instanceof Error) return signal.reason;
+    return new DOMException('Timeline voice handoff was aborted', 'AbortError');
+  };
+  if (signal.aborted) throw abortError();
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    void _voiceChain.catch(() => undefined).then(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    });
+  });
+}
+
 // --- Jingle collision guard (issue #997) -----------------------------------
 //
 // Jingles rotate into the broadcast inside Liquidsoap (radio.liq's jingle

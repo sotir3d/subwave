@@ -30,6 +30,19 @@ import { cachedHealthProbe } from '../util/health-probe.js';
 const PROBE_TIMEOUT_MS = 5_000;
 const PROBE_INTERVAL_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 180_000;
+const LONG_REQUEST_TIMEOUT_MAX_MS = 15 * 60_000;
+
+export interface RemoteTtsCapabilities {
+  ok: boolean;
+  ready?: boolean;
+  engine?: string;
+  streaming?: boolean;
+  maxSeconds?: number;
+  voices?: string[];
+  [key: string]: unknown;
+}
+
+let lastCapabilities: RemoteTtsCapabilities | null = null;
 
 function getUrl(): string {
   return settings.get().tts?.remote?.url || '';
@@ -44,9 +57,12 @@ async function probeOnce(): Promise<boolean> {
   try {
     const res = await fetchWithTimeout(`${url}/health`, { timeoutMs: PROBE_TIMEOUT_MS, bodyDeadline: true });
     if (!res.ok) return false;
-    const body = (await res.json()) as { ok?: boolean };
-    return !!body.ok;
+    const body = (await res.json()) as RemoteTtsCapabilities;
+    const available = body.ok === true && body.ready !== false;
+    lastCapabilities = available ? { ...body, ok: true } : null;
+    return available;
   } catch {
+    lastCapabilities = null;
     return false;
   }
 }
@@ -85,14 +101,26 @@ export async function refresh(): Promise<void> {
   await probe.refresh();
 }
 
+// Optional health metadata for long-form production. Existing endpoints that
+// return only {ok:true} remain fully compatible; richer Windows wrappers can
+// advertise the resident engine and its preferred acoustic-context limit.
+export function capabilities(): RemoteTtsCapabilities | null {
+  return lastCapabilities ? { ...lastCapabilities } : null;
+}
+
 export function isAvailable(): boolean {
   if (!getUrl()) return false;
   return probe.get();
 }
 
-export async function speak(
+async function speakNow(
   text: string,
-  { outPath: customPath, voice }: { outPath?: string; voice?: string },
+  {
+    outPath: customPath,
+    voice,
+    signal,
+    strictVoice = false,
+  }: { outPath?: string; voice?: string; signal?: AbortSignal; strictVoice?: boolean },
 ): Promise<string> {
   const url = getUrl();
   if (!url) throw new Error('remote TTS URL not configured');
@@ -101,11 +129,23 @@ export async function speak(
   const outPath = customPath || path.join(config.piper.outDir, `${crypto.randomBytes(6).toString('hex')}.wav`);
   await mkdir(path.dirname(outPath), { recursive: true });
 
+  // A conservative short-link floor plus audio-length headroom for advertised
+  // long-context voices. At ~132 spoken wpm, allow up to 2x realtime + 30s;
+  // Echo-sized chunks retain the existing 180s cap while a FireRed-sized
+  // multi-minute request is not killed exactly as its audio finishes.
+  const estimatedAudioMs = Math.ceil(text.trim().split(/\s+/).length / 2.2) * 1_000;
+  const timeoutMs = Math.min(
+    LONG_REQUEST_TIMEOUT_MAX_MS,
+    Math.max(REQUEST_TIMEOUT_MS, estimatedAudioMs * 2 + 30_000),
+  );
+
   const res = await fetchWithTimeout(`${url}/speak`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text: text.trim(), voice: voice ?? '' }),
-    timeoutMs: REQUEST_TIMEOUT_MS,
+    timeoutMs,
+    bodyDeadline: true,
+    signal,
   });
   if (!res.ok) {
     const errBody = await res.text().catch(() => '');
@@ -115,6 +155,23 @@ export async function speak(
   // and Liquidsoap can both read it (no shared volume needed). An empty body
   // throws so the dispatcher falls back to Piper instead of handing Liquidsoap
   // a zero-byte file (a silent segment with no error).
+  const fallbackHeader = res.headers.get('x-tts-fell-back');
+  const reportedFallback = fallbackHeader != null && !/^(?:0|false|no)$/i.test(fallbackHeader.trim());
+  const requestedVoice = voice?.trim() || '';
+  const voiceUsed = res.headers.get('x-tts-voice-used')?.trim() || '';
+  const reportedMismatch = !!requestedVoice && !!voiceUsed && requestedVoice !== voiceUsed;
+  const voiceUnverified = !!requestedVoice && !voiceUsed;
+  if ((reportedFallback || reportedMismatch || voiceUnverified) && strictVoice) {
+    throw new Error(
+      `remote TTS did not honour voice "${requestedVoice}": `
+      + (res.headers.get('x-tts-fell-back-reason')
+        || (voiceUsed
+          ? `provider rendered "${voiceUsed}"`
+          : reportedFallback
+            ? 'provider reported a fallback'
+            : 'provider did not return X-TTS-Voice-Used')),
+    );
+  }
   const audio = Buffer.from(await res.arrayBuffer());
   if (audio.length === 0) throw new Error('remote TTS returned an empty response body');
   await writeFile(outPath, audio);
@@ -122,7 +179,7 @@ export async function speak(
   // Make a silent voice substitution visible (issue #238): the call succeeded
   // and audio plays, but NOT in the requested voice. Surfaced via optional
   // response headers since the body carries audio, not JSON.
-  if (res.headers.get('x-tts-fell-back')) {
+  if (reportedFallback || reportedMismatch) {
     console.warn(
       `[remote] requested voice "${voice || ''}" not honoured`
         + ` (${res.headers.get('x-tts-fell-back-reason') || 'fell back'});`
@@ -130,4 +187,71 @@ export async function speak(
     );
   }
   return outPath;
+}
+
+// Remote neural voices generally occupy one GPU and do not benefit from two
+// simultaneous HTTP requests. Serialize every remote render (short links and
+// long-form chapters alike) so the Windows wrapper never has to absorb a burst
+// from independent controller crons. The queue is intentionally separate from
+// the LLM admission lane: on a two-GPU host, script N+1 and voice N may overlap.
+interface RemoteRenderJob {
+  text: string;
+  opts: { outPath?: string; voice?: string; signal?: AbortSignal; strictVoice?: boolean };
+  resolve: (path: string) => void;
+  reject: (error: unknown) => void;
+  onAbort?: () => void;
+}
+
+const renderQueue: RemoteRenderJob[] = [];
+let activeRenders = 0;
+
+function remoteAbortError(signal?: AbortSignal): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error('Remote TTS render was aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function drainRenderQueue(): void {
+  if (activeRenders > 0) return;
+  const job = renderQueue.shift();
+  if (!job) return;
+  if (job.onAbort && job.opts.signal) job.opts.signal.removeEventListener('abort', job.onAbort);
+  if (job.opts.signal?.aborted) {
+    job.reject(remoteAbortError(job.opts.signal));
+    drainRenderQueue();
+    return;
+  }
+  activeRenders = 1;
+  void speakNow(job.text, job.opts).then(job.resolve, job.reject).finally(() => {
+    activeRenders = 0;
+    drainRenderQueue();
+  });
+}
+
+export async function speak(
+  text: string,
+  opts: { outPath?: string; voice?: string; signal?: AbortSignal; strictVoice?: boolean },
+): Promise<string> {
+  if (opts.signal?.aborted) throw remoteAbortError(opts.signal);
+  return new Promise<string>((resolve, reject) => {
+    const job: RemoteRenderJob = { text, opts, resolve, reject };
+    if (opts.signal) {
+      job.onAbort = () => {
+        const index = renderQueue.indexOf(job);
+        if (index < 0) return; // active fetch owns cancellation via its signal
+        renderQueue.splice(index, 1);
+        opts.signal?.removeEventListener('abort', job.onAbort!);
+        reject(remoteAbortError(opts.signal));
+      };
+      opts.signal.addEventListener('abort', job.onAbort, { once: true });
+    }
+    renderQueue.push(job);
+    drainRenderQueue();
+  });
+}
+
+export function renderQueueStatus(): { active: number; queued: number } {
+  return { active: activeRenders, queued: renderQueue.length };
 }

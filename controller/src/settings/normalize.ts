@@ -35,6 +35,7 @@ import {
   coerceExcludedPlaylistIds,
   coerceGuestPersonaIds,
   coercePlaylistIds,
+  coerceSpokenProgramme,
   coerceShowEnergies,
   coerceShowEras,
   coerceShowGenres,
@@ -254,8 +255,12 @@ export function normalizeShows(raw: unknown, personaIds: string[]): NormalizedSh
     // feature beat to one segment capability kind; free text, resolved against
     // the live skill catalog at air time (a stale kind degrades to the
     // producer's choice, same tolerance as playlistIds).
-    const programme = item.programme === true;
     const segmentSkill = typeof item.segmentSkill === 'string' ? item.segmentSkill.trim().slice(0, 64) : '';
+    const spoken = coerceSpokenProgramme(item.spoken);
+    // Both modes own the same programme talk slots. If an old/hand-edited
+    // settings file enables both, long-form wins so the legacy intro/feature/
+    // outro runner cannot inject a second competing episode arc.
+    const programme = item.programme === true && !spoken.enabled;
     out.push({
       id,
       name,
@@ -265,6 +270,7 @@ export function normalizeShows(raw: unknown, personaIds: string[]): NormalizedSh
       banter,
       programme,
       segmentSkill,
+      spoken,
       moods,
       themeId,
       genres,

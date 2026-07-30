@@ -10,6 +10,20 @@ export const SHOWS_MAX = 64;
 // Mirrors the controller's GUESTS_PER_SHOW cap (settings.ts).
 export const GUESTS_MAX = 3;
 
+export type SpokenFormat = 'custom' | 'current-events' | 'stories' | 'dj-story' | 'dj-diary';
+
+export interface SpokenProgrammeConfig {
+  enabled: boolean;
+  format: SpokenFormat;
+  /** Additional creative/editorial brief. The show's topic remains the
+   *  programme-wide brief and is supplied alongside this text. */
+  prompt: string;
+  /** Total block length, including any planned song breaks. */
+  targetMinutes: number;
+  useWeb: boolean;
+  musicBreaks: number;
+}
+
 export interface Show {
   id: string;
   name: string;
@@ -67,6 +81,10 @@ export interface Show {
    *  roundup). Empty = the producer picks per episode. Only used with
    *  programme on. */
   segmentSkill: string;
+  /** Listener-triggered, rolling long-form production. Nothing is generated
+   *  while the station has no audience; music covers provider cold starts and
+   *  any runtime underrun. */
+  spoken: SpokenProgrammeConfig;
 }
 
 /** One era window (mirrors the controller's EraWindow). Multiple windows let a

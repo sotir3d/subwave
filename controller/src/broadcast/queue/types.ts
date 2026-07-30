@@ -58,7 +58,15 @@ export interface Track {
 // `history` are the same shape with the runtime-stamped startedAt/endedAt/
 // source added.
 export interface QueueItem {
+  // Missing means a legacy/ordinary music item.  Talk is a standalone WAV in
+  // the request.queue timeline, never a say.txt/intro.txt overlay.
+  kind?: 'track' | 'talk';
   track: Track;
+  talk?: {
+    id: string;
+    wavPath: string;
+    gainDb?: number;
+  } | null;
   requestedBy?: string | null;
   intent?: string | null;
   introScript?: string | null;
@@ -131,6 +139,8 @@ export interface NowPlaying {
   artist?: string | null;
   album?: string | null;
   subsonic_id?: string | null;
+  subwave_kind?: string | null;
+  talk_id?: string | null;
   [k: string]: unknown;
 }
 

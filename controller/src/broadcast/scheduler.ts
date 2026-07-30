@@ -522,6 +522,7 @@ async function hourlyCheck() {
   const rolled = await rollSessionNow({ airHandoff: false });
   if (rolled.ctx && (rolled.introAired || programme.suppressHourly())) return;
   if (!shouldFire('hourly')) return;
+  if (!autoVoiceAllowed()) return;
   if (!djCallsAllowed()) return;  // nobody listening — stay on the auto playlist
   if (!optionalSegmentsAllowed()) return;  // over the daily token budget — mute optional segments
   try {
@@ -600,6 +601,7 @@ async function banterTick() {
   const { show, guests } = settings.getOnAirRoster();
   if (!show?.banter || !guests.length) return;  // solo show, or banter not opted in
   if (!shouldFire('banter')) return;
+  if (!autoVoiceAllowed()) return;
   if (!djCallsAllowed()) return;  // nobody listening — save the tokens and the breath
   if (!optionalSegmentsAllowed()) return;  // over the daily token budget — mute optional segments
   // Every standalone talk break counts — idents, hourly, handoff, banter AND
@@ -720,6 +722,7 @@ export async function runStationId({ atNextTrack = false } = {}) {
 
 async function stationId() {
   if (!shouldFire('stationId')) return;
+  if (!autoVoiceAllowed()) return;
   if (!djCallsAllowed()) return;  // nobody listening — skip the ident
   if (!optionalSegmentsAllowed()) return;  // over the daily token budget — mute optional segments
   try {

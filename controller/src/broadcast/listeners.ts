@@ -32,6 +32,29 @@ let lastCount: number | null = null;        // null = unknown (not yet polled, o
 let peakSeen = 0;                            // running max of the deduped count this process run
 let consecutiveStatusFailures = 0;          // resets to 0 on every successful poll
 
+type ListenerCountSubscriber = (count: number | null, previous: number | null) => void | Promise<void>;
+const countSubscribers = new Set<ListenerCountSubscriber>();
+
+// Rising/falling-edge subscription for demand-driven producers. Callbacks are
+// detached from the Icecast poll: a slow model-health probe must never delay
+// listener status refresh or the public now-playing endpoint.
+export function onListenerCountChange(subscriber: ListenerCountSubscriber): () => void {
+  countSubscribers.add(subscriber);
+  return () => countSubscribers.delete(subscriber);
+}
+
+function publishCountChange(previous: number | null): void {
+  const current = lastCount;
+  if (previous === current) return;
+  for (const subscriber of countSubscribers) {
+    queueMicrotask(() => {
+      Promise.resolve(subscriber(current, previous)).catch((err) => {
+        console.error('[listeners] count subscriber failed:', err instanceof Error ? err.message : err);
+      });
+    });
+  }
+}
+
 // Full cached stream status, refreshed by the same poll that maintains
 // lastCount. `online` is true when at least one broadcast mount has a source
 // attached; `peak` sums listener_peak across both mounts. Read by the public
@@ -104,6 +127,7 @@ function audioParam(src: any, key: 'samplerate' | 'channels'): number | null {
 }
 
 async function fetchCount(persistHistory = true) {
+  const previousCount = lastCount;
   let online = false;
   let bitrate: number | null = null;
   let sampleRate: number | null = null;
@@ -174,6 +198,7 @@ async function fetchCount(persistHistory = true) {
       appendFile(HISTORY_FILE, line).catch(() => {});  // best-effort
     }
   }
+  publishCountChange(previousCount);
   return lastCount;
 }
 
@@ -243,8 +268,16 @@ export function djCallsAllowed() {
 }
 
 export function startListenerMonitor() {
-  fetchCount();
-  setInterval(fetchCount, 15000);
+  // Poll more eagerly only while an empty station is configured to coast with
+  // no LLM calls. That trims demand-driven cold-start detection from 15s to at
+  // most 5s without multiplying Icecast traffic while somebody is listening.
+  const loop = async () => {
+    await fetchCount();
+    const emptyCoast = settings.get()?.llm?.pauseWhenEmpty === true && lastCount === 0;
+    const timer = setTimeout(loop, emptyCoast ? 5_000 : 15_000);
+    timer.unref();
+  };
+  loop().catch(() => {});
 }
 
 // Read the recent listener history for the admin sparkline. Returns rows

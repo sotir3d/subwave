@@ -96,6 +96,7 @@ export async function withFailover<T>(
   failExtra: (err: any) => any,
   attempt: (leg: any) => Promise<AttemptResult<T>>,
   pin?: 'primary' | 'fallback',
+  signal?: AbortSignal,
 ): Promise<T> {
   if (pin) {
     const leg = pin === 'fallback' ? fallbackLeg() : primaryLeg();
@@ -122,7 +123,14 @@ export async function withFailover<T>(
     const quotaOrAuth = isQuotaOrAuthError(err);
     const upstreamOverloaded = isUpstreamOverloaded(err);
     const rateLimited = isRateLimited(err);
-    const backup = (isUnreachable(err) || quotaOrAuth || upstreamOverloaded || rateLimited) ? fallbackLeg() : null;
+    // A caller-directed abort is terminal for this logical call. Provider
+    // transports commonly surface it as AbortError, which is otherwise in the
+    // host-unreachable classifier; never turn an explicit cancellation into a
+    // surprise request against the fallback leg.
+    const backup = !signal?.aborted
+      && (isUnreachable(err) || quotaOrAuth || upstreamOverloaded || rateLimited)
+      ? fallbackLeg()
+      : null;
     if (!backup) {
       logFailurePreview(kind, err);
       recordFailure({ kind, started: primaryStarted, via: primaryVia, model: primary.label, error: err?.message, extra: failExtra(err) });

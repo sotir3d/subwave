@@ -61,6 +61,28 @@ end
 np_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/now-playing")
 jingle_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/jingle")
 bed_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/bed")
+talk_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/talk")
+talk_np_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/talk-now-playing")
+talk_epoch_tmp_dir = ensure_tmp_dir("#{state_dir}/tmp/talk-epoch")
+
+# Mixer-instance receipt for restart-safe long-form recovery. A controller may
+# restart while this mixer keeps playing (the marker remains valid), but a new
+# mixer has an empty in-memory request.queue and must invalidate every old
+# ARMED/PLAYING receipt before the controller can re-arm it.
+mixer_started_at = time()
+mixer_epoch = "#{mixer_started_at}"
+if file.exists("#{state_dir}/talk-playing.json") then
+  file.remove("#{state_dir}/talk-playing.json")
+end
+file.write(
+  data=json.stringify(compact=true, {
+    epoch = mixer_epoch,
+    startedAt = mixer_started_at
+  }),
+  atomic=true,
+  temp_dir=talk_epoch_tmp_dir,
+  "#{state_dir}/talk-mixer-epoch.json"
+)
 
 # ---------------------------------------------------------------------------
 # RUNTIME SETTINGS — written by the controller at startup, read here.
@@ -342,6 +364,18 @@ music = cue_cut(music)
 # Absent / unparseable → crossfade_duration(), i.e. the global startup default.
 def dj_transition(a, b) =
   d = float_of_string(default=crossfade_duration(), a.metadata["liq_cross_duration"])
+  # Longform spoken chapters are timeline items, never overlays. On either
+  # edge, sequence the buffered outgoing tail and incoming source instead of
+  # adding them together. No song is audible beneath speech, and no speech is
+  # eaten by a music crossfade. Tiny edge fades remove clicks without overlap.
+  talk_edge = a.metadata["subwave_kind"] == "talk" or b.metadata["subwave_kind"] == "talk"
+  if talk_edge then
+    log("Timeline talk edge: sequencing without overlap")
+    sequence(merge=true, [
+      fade.out(duration=0.15, initial_metadata=a.metadata, a.source),
+      fade.in(duration=0.04, initial_metadata=b.metadata, b.source)
+    ])
+  else
   # Washout rides the ENDING track's own annotation — `a` IS the flagged track,
   # so there is no arming, no remaining() watcher, and no race against a
   # listener request jumping the queue. The controller stamps liq_washout_delay
@@ -997,6 +1031,7 @@ def dj_transition(a, b) =
       b_source
     end
   add(normalize=false, [a_source, b_source])
+  end
 end
 
 # Keep a handle on the PRE-cross music source so the on_metadata hook
@@ -1016,6 +1051,10 @@ music_meta = music
 # it (exactly as it does for an empty jingles.m3u) and the jingle defers to
 # the next real track boundary.
 bed_on_air = ref(false)
+# A standalone spoken chapter in the request.queue timeline. It gates jingles
+# until the following music source has actually taken over, so no stinger can
+# split a chapter from its planned exit.
+talk_on_air = ref(false)
 
 # JINGLES & STATION ID — rotate a jingle in every N tracks.
 #
@@ -1064,7 +1103,7 @@ music =
     )
     # A bed on air makes jingles unavailable (see bed_on_air above) so the
     # rotate can't split a bed from the song it ramps into.
-    jingles = source.available(jingles, {not bed_on_air()})
+    jingles = source.available(jingles, {not bed_on_air() and not talk_on_air()})
     rotate(
       weights=[1, jingle_ratio()],  # 1 jingle for every N music tracks (settings.json)
       [jingles, music]
@@ -1102,6 +1141,13 @@ music = cross(
   dj_transition,
   music
 )
+
+# A second metadata observation point, deliberately POST-cross. Normal music
+# now-playing remains on music_meta (pre-cross) to avoid the duplicate packets
+# produced by ordinary fades. Talk lifecycle needs the post-cross edge: only
+# here does "started" mean the first spoken frame is actually on air and
+# "finished" mean the following source has really taken over.
+talk_timeline_meta = music
 
 # ---------------------------------------------------------------------------
 # DJ VOICE — TTS intros that duck the music
@@ -1453,7 +1499,15 @@ def on_meta(m) =
   #
   # Same shape and rationale as jingle-playing.json (#997): liquidsoap telling
   # the controller that a non-track thing started.
-  if m["subwave_kind"] == "bed" then
+  if m["subwave_kind"] == "talk" then
+    # Lifecycle/now-playing is published from the post-cross hook below. Here
+    # we only close the jingle gate as soon as Liquidsoap starts preparing the
+    # chapter. Keeping talk out of this pre-cross publisher prevents a long
+    # outgoing music canvas from advertising speech before it is audible.
+    log("on_meta: timeline talk prepared (#{filename})")
+    talk_on_air := true
+    bed_on_air := false
+  elsif m["subwave_kind"] == "bed" then
     log("on_meta: bed started (#{filename})")
     bed_on_air := true
     file.write(
@@ -1512,6 +1566,139 @@ end
 # synchronous=false (2.3+ mandatory arg): on_meta does file I/O — run it on
 # the task queue, not the streaming thread.
 music_meta.on_metadata(synchronous=false, on_meta)
+
+# ---------------------------------------------------------------------------
+# TIMELINE TALK LIFECYCLE — post-cross start/finish acknowledgements
+# ---------------------------------------------------------------------------
+# The pre-cross hook above is correct for normal music metadata but too early
+# for a pause-then-talk edge: it fires while cross() is still buffering the
+# outgoing tail. This hook sees the sequenced edge at the actual playout point.
+# One atomic marker is updated from started -> finished; the producer correlates
+# it with talk_id before advancing a persistent chapter manifest.
+active_talk_id = ref("")
+active_talk_title = ref("")
+active_talk_speaker = ref("")
+active_talk_filename = ref("")
+active_talk_started_at = ref(0.0)
+
+def publish_talk_start(m) =
+  id = m["talk_id"]
+  title = m["title"]
+  speaker = m["artist"]
+  filename = m["filename"]
+  started = time()
+  active_talk_id := id
+  active_talk_title := title
+  active_talk_speaker := speaker
+  active_talk_filename := filename
+  active_talk_started_at := started
+  talk_on_air := true
+  bed_on_air := false
+  log("timeline talk started: #{id} | #{title} | #{speaker}")
+  file.write(
+    data=json.stringify(compact=true, {
+      id = id,
+      title = title,
+      speaker = speaker,
+      filename = filename,
+      status = "started",
+      startedAt = started,
+      mixerEpoch = mixer_epoch
+    }),
+    atomic=true,
+    temp_dir=talk_tmp_dir,
+    "#{state_dir}/talk-playing.json"
+  )
+  ts = int_of_float(started)
+  payload = json.stringify(compact=true, {
+    title = title,
+    artist = speaker,
+    album = "Spoken word",
+    subsonic_id = m["subsonic_id"],
+    subwave_kind = "talk",
+    talk_id = id,
+    filename = filename,
+    timestamp = ts
+  })
+  file.write(data=payload, atomic=true, temp_dir=talk_np_tmp_dir, "#{state_dir}/now-playing.json")
+  radio.insert_metadata([
+    ("title", title),
+    ("artist", speaker),
+    ("album", "Spoken word")
+  ])
+end
+
+def publish_talk_finish(next_meta) =
+  finished = time()
+  log("timeline talk finished: #{active_talk_id()}")
+  file.write(
+    data=json.stringify(compact=true, {
+      id = active_talk_id(),
+      title = active_talk_title(),
+      speaker = active_talk_speaker(),
+      filename = active_talk_filename(),
+      status = "finished",
+      startedAt = active_talk_started_at(),
+      finishedAt = finished,
+      mixerEpoch = mixer_epoch
+    }),
+    atomic=true,
+    temp_dir=talk_tmp_dir,
+    "#{state_dir}/talk-playing.json"
+  )
+  active_talk_id := ""
+  active_talk_title := ""
+  active_talk_speaker := ""
+  active_talk_filename := ""
+  active_talk_started_at := 0.0
+  talk_on_air := false
+
+  # Re-publish the successor at the actual takeover point. The ordinary
+  # pre-cross hook may have announced it up to TALK_EDGE_SEC early.
+  title = next_meta["title"]
+  artist = next_meta["artist"]
+  if title != "" or artist != "" then
+    payload = json.stringify(compact=true, {
+      title = title,
+      artist = artist,
+      album = next_meta["album"],
+      subsonic_id = next_meta["subsonic_id"],
+      filename = next_meta["filename"],
+      timestamp = int_of_float(finished)
+    })
+    file.write(data=payload, atomic=true, temp_dir=talk_np_tmp_dir, "#{state_dir}/now-playing.json")
+    radio.insert_metadata([
+      ("title", title),
+      ("artist", artist),
+      ("album", next_meta["album"])
+    ])
+  else
+    if file.exists("#{state_dir}/now-playing.json") then
+      file.remove("#{state_dir}/now-playing.json")
+    end
+  end
+end
+
+def on_talk_timeline_meta(m) =
+  if m["subwave_kind"] == "talk" then
+    id = m["talk_id"]
+    if id != "" and id != active_talk_id() then
+      # Back-to-back production units share a sequenced talk edge. Close the
+      # previous unit before replacing its correlation id; the controller may
+      # observe only the new started marker (both atomic writes happen in one
+      # callback), in which case that successor start is also conclusive proof
+      # that the previous unit finished.
+      if active_talk_id() != "" then
+        publish_talk_finish(m)
+      end
+      publish_talk_start(m)
+    end
+  elsif active_talk_id() != "" then
+    publish_talk_finish(m)
+  end
+end
+
+talk_timeline_meta.on_metadata(synchronous=false, on_talk_timeline_meta)
 
 # ---------------------------------------------------------------------------
 # OUTPUT — broadcast to Icecast

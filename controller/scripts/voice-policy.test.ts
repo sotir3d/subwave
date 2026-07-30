@@ -24,7 +24,14 @@ const root = mkdtempSync(join(tmpdir(), 'subwave-voice-'));
 process.env.STATE_DIR = root;
 
 const settings = await import('../src/settings.js');
-const { voiceEnabled, autoVoiceAllowed, voiceStatus } = await import('../src/broadcast/voice-policy.js');
+const {
+  voiceEnabled,
+  autoVoiceAllowed,
+  voiceStatus,
+  setExclusiveTimelineVoiceOwner,
+  exclusiveTimelineVoiceOwner,
+  timelineVoiceBlocked,
+} = await import('../src/broadcast/voice-policy.js');
 const { shouldFire } = await import('../src/broadcast/dj-gate.js');
 const { requestSchema } = await import('../src/broadcast/dj-agent/schemas.js');
 
@@ -56,7 +63,11 @@ try {
   await settings.load();
   assert.equal(voiceEnabled(), true, 'fresh install defaults to voice ON');
   assert.equal(autoVoiceAllowed(), true, 'fresh install allows autonomous voice');
-  assert.deepEqual(voiceStatus(), { enabled: true }, 'status snapshot mirrors the switch');
+  assert.deepEqual(voiceStatus(), {
+    enabled: true,
+    timelineOwner: null,
+    autonomousAllowed: true,
+  }, 'status snapshot mirrors both voice gates');
 
   // A persona loud enough that every slot is live — the baseline the OFF case
   // is measured against. Without this the "nothing fires" assertions below
@@ -73,10 +84,43 @@ try {
   );
 
   // ── OFF: nothing autonomous fires, at any minute, for any kind ─────────────
+  setExclusiveTimelineVoiceOwner('episode:morning-story');
+  assert.equal(exclusiveTimelineVoiceOwner(), 'episode:morning-story');
+  assert.equal(timelineVoiceBlocked(), true);
+  assert.equal(voiceEnabled(), true, 'exclusive ownership does not rewrite the operator switch');
+  assert.equal(autoVoiceAllowed(), false, 'autonomous voice stands down while long-form owns the mic');
+  assert.deepEqual(voiceStatus(), {
+    enabled: true,
+    timelineOwner: 'episode:morning-story',
+    autonomousAllowed: false,
+  });
+  for (const m of MINUTES) {
+    for (const k of KINDS) {
+      assert.equal(shouldFire(k, atMinute(m)), false, `timeline owner gags ${k} at :${m}`);
+    }
+  }
+  assert.ok(
+    !('intro' in shapeOf(requestSchema())),
+    'request-agent contract cannot generate a ducked intro over timeline narration',
+  );
+
+  setExclusiveTimelineVoiceOwner('   ');
+  assert.equal(exclusiveTimelineVoiceOwner(), null, 'blank owner releases the lease');
+  assert.equal(timelineVoiceBlocked(), false);
+  assert.equal(autoVoiceAllowed(), true);
+  assert.ok('intro' in shapeOf(requestSchema()), 'releasing the timeline restores voice contracts');
+  const afterExclusive = MINUTES.flatMap(m => KINDS.map(k => ({ k, m })))
+    .filter(({ k, m }) => shouldFire(k, atMinute(m)));
+  assert.deepEqual(afterExclusive, liveSlots, 'exclusive ownership is fully reversible');
+
   await settings.update({ tts: { enabled: false } });
   assert.equal(voiceEnabled(), false, 'update({tts:{enabled:false}}) takes effect');
   assert.equal(autoVoiceAllowed(), false, 'autonomous voice is refused');
-  assert.deepEqual(voiceStatus(), { enabled: false }, 'status snapshot follows');
+  assert.deepEqual(voiceStatus(), {
+    enabled: false,
+    timelineOwner: null,
+    autonomousAllowed: false,
+  }, 'status snapshot follows');
 
   for (const m of MINUTES) {
     for (const k of KINDS) {
@@ -127,5 +171,6 @@ try {
 
   console.log('voice-policy.test.ts — all assertions passed');
 } finally {
+  setExclusiveTimelineVoiceOwner(null);
   rmSync(root, { recursive: true, force: true });
 }

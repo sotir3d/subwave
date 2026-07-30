@@ -37,6 +37,7 @@
 import { Output, isStepCount, hasToolCall, ToolLoopAgent, tool } from 'ai';
 import type { ModelMessage, ToolSet } from 'ai';
 import { z } from 'zod';
+import { withLlmAdmission } from '../core/admission.js';
 import { withFailover } from '../core/failover.js';
 import { withTransientRetry, withDeadline } from '../core/retry.js';
 import { stripThinking, extractJson, usageOf, perfOf, warningsOf, flattenToolCalls, failureDiagnostics, renderTerminalPrompt } from '../core/pure.js';
@@ -85,6 +86,10 @@ interface DjAgentOptions {
   kind?: string;
   timeoutMs?: number;
   validate?: (object: unknown) => boolean;
+  priority?: number;
+  neededBy?: number | Date;
+  dropIfLate?: boolean;
+  signal?: AbortSignal;
 }
 
 // Operator-overridable via settings.llm.maxOutputTokens (issue #712); 0 keeps
@@ -185,9 +190,15 @@ function buildRecoveryAgent(leg: Leg, system: string, allTools: ToolSet | undefi
 // stateless path (Copilot review, PR #923) — a slow main run now correctly
 // leaves less time for recovery instead of resetting the clock. undefined
 // means no deadline at all (unlimited).
-function runDeadlinedCall<T>(deadlineAt: number | undefined, kind: string, label: string, fn: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+function runDeadlinedCall<T>(
+  deadlineAt: number | undefined,
+  kind: string,
+  label: string,
+  fn: (signal?: AbortSignal) => Promise<T>,
+  callerSignal?: AbortSignal,
+): Promise<T> {
   if (deadlineAt == null) {
-    return withTransientRetry(kind, () => fn());
+    return withTransientRetry(kind, () => fn(callerSignal), callerSignal);
   }
   const remaining = deadlineAt - Date.now();
   if (remaining <= 0) {
@@ -195,15 +206,26 @@ function runDeadlinedCall<T>(deadlineAt: number | undefined, kind: string, label
     err.name = 'AgentDeadlineError';
     return Promise.reject(err);
   }
-  return withDeadline(remaining, `${kind} ${label}`, (signal) =>
-    withTransientRetry(kind, () => fn(signal), signal));
+  return withDeadline(remaining, `${kind} ${label}`, (deadlineSignal) => {
+    const signal = callerSignal && deadlineSignal
+      ? AbortSignal.any([callerSignal, deadlineSignal])
+      : callerSignal ?? deadlineSignal;
+    return withTransientRetry(kind, () => fn(signal), signal);
+  });
 }
 
-function runDeadlined(deadlineAt: number | undefined, kind: string, label: string, agent: AgentLike, messages: ModelMessage[]): Promise<AgentGenerateResult> {
+function runDeadlined(
+  deadlineAt: number | undefined,
+  kind: string,
+  label: string,
+  agent: AgentLike,
+  messages: ModelMessage[],
+  callerSignal?: AbortSignal,
+): Promise<AgentGenerateResult> {
   return runDeadlinedCall(deadlineAt, kind, label, (signal) => agent.generate({
     messages,
     ...(signal ? { abortSignal: signal } : {}),
-  }));
+  }), callerSignal);
 }
 
 export async function djAgent({
@@ -216,6 +238,10 @@ export async function djAgent({
   maxOutputTokens = resolveMaxOutputTokens(MAX_TOKENS_AGENT),
   kind = 'sdk.djAgent',
   timeoutMs,
+  priority,
+  neededBy,
+  dropIfLate = false,
+  signal,
   // Optional caller-supplied acceptance check on the native path's object
   // (e.g. "the picked id must be one a discovery tool actually surfaced").
   // The native path is the only branch with no structural control over WHAT
@@ -229,10 +255,12 @@ export async function djAgent({
   // caller repairs those itself with the full `seen` context.
   validate,
 }: DjAgentOptions): Promise<{ object: unknown; steps: number; toolCalls: ToolCallSummary[] }> {
-  return withFailover(
-    kind,
-    (err) => ({ system, messages, ...failureDiagnostics(err) }),
-    async (leg: Leg) => {
+  return withLlmAdmission(
+    { kind, priority, neededBy, dropIfLate, signal },
+    () => withFailover(
+      kind,
+      (err) => ({ system, messages, ...failureDiagnostics(err) }),
+      async (leg: Leg) => {
       const toolCount = tools ? Object.keys(tools).length : 0;
       const plan = agentPlan(leg.cfg, schema, toolCount);
       // Default to the agent path; branches override before their await. A
@@ -247,8 +275,15 @@ export async function djAgent({
         // NoObjectGeneratedError. Get the structured result from a forced tool call.
         if (plan === 'object-via-tool') {
           lastVia = 'ai-sdk:tool';
-          const { object, usage, perf, warnings } = await withTransientRetry(kind,
-            () => objectViaToolCall(leg, { system, prompt: undefined, messages, schema, temperature, maxOutputTokens }));
+          const { object, usage, perf, warnings } = await runDeadlinedCall(
+            deadlineAt,
+            kind,
+            'object via tool',
+            (runSignal) => objectViaToolCall(leg, {
+              system, prompt: undefined, messages, schema, temperature, maxOutputTokens, signal: runSignal,
+            }),
+            signal,
+          );
           return {
             value: { object, steps: 0, toolCalls: [] },
             via: lastVia,
@@ -301,7 +336,7 @@ export async function djAgent({
               reasoning: reasoningFor(leg.cfg, { forceNoThink: true }),
               output: Output.object({ schema: schema! }),
             } as any);
-            const nr = await runDeadlined(deadlineAt, kind, 'native run', nativeAgent, messages);
+            const nr = await runDeadlined(deadlineAt, kind, 'native run', nativeAgent, messages, signal);
             const nObj = nr.output;
             const nSteps = nr.steps?.length ?? 0;
             // The cross-provider failure signature is "emitted the object WITHOUT
@@ -374,7 +409,7 @@ export async function djAgent({
         // timeoutMs (when set) is a hard ceiling — a slow/looping run throws,
         // flows through the catch below, and the caller falls back to its
         // stateless path rather than blocking on a pathological model call.
-        let result = await runDeadlined(deadlineAt, kind, 'agent run', agent, messages);
+        let result = await runDeadlined(deadlineAt, kind, 'agent run', agent, messages, signal);
         let steps = result.steps?.length ?? 0;
         addUsage(usageOf(result));
 
@@ -429,7 +464,7 @@ export async function djAgent({
           const priorMessages = result.response?.messages || [];
           const recoveryMessages = priorMessages.length ? [...messages, ...priorMessages] : messages;
           result = await runDeadlined(deadlineAt, kind, 'agent recovery',
-            buildRecoveryAgent(leg, system, allTools, temperature, maxOutputTokens, forcedChoice), recoveryMessages);
+            buildRecoveryAgent(leg, system, allTools, temperature, maxOutputTokens, forcedChoice), recoveryMessages, signal);
           steps = result.steps?.length ?? 0;
           addUsage(usageOf(result));
           captureTrail(result);
@@ -462,9 +497,9 @@ export async function djAgent({
             try {
               const prompt = renderTerminalPrompt(messages, discoveryTrail);
               const t = await runDeadlinedCall(deadlineAt, kind, 'agent terminal collapse',
-                (signal) => objectViaToolCall(leg, {
-                  system, prompt, schema, temperature, maxOutputTokens, signal,
-                }));
+                (runSignal) => objectViaToolCall(leg, {
+                  system, prompt, schema, temperature, maxOutputTokens, signal: runSignal,
+                }), signal);
               terminalObject = t.object;
               addUsage(t.usage);
               terminalPrompt = prompt;
@@ -550,6 +585,9 @@ export async function djAgent({
         (err as { __via?: string }).__via = lastVia;
         throw err;
       }
-    },
+      },
+      undefined,
+      signal,
+    ),
   );
 }

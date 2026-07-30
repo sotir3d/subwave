@@ -777,6 +777,75 @@ export const PERSONA_LIMIT = 48;
 // llm/internal/core/pure.ts.
 export const SOUL_MAX = 2000;
 export const SHOWS_LIMIT = 64;
+// Listener-triggered long-form spoken programme settings. `targetMinutes`
+// describes the whole block (speech plus planned music breaks), not one TTS
+// request. The producer always renders it chapter-by-chapter at runtime.
+export const SPOKEN_FORMATS = ['custom', 'current-events', 'stories', 'dj-story', 'dj-diary'] as const;
+export type SpokenFormat = (typeof SPOKEN_FORMATS)[number];
+export const SPOKEN_PROMPT_MAX = 4000;
+export const SPOKEN_TARGET_MINUTES_MIN = 1;
+export const SPOKEN_TARGET_MINUTES_MAX = 180;
+export const SPOKEN_MUSIC_BREAKS_MAX = 12;
+export const SPOKEN_ASSUMED_SONG_MINUTES = 4;
+export const SPOKEN_MIN_UNIT_MINUTES = 1;
+
+// A break needs a complete song and therefore also creates another spoken
+// act. Keeping at least one minute of narration on both sides makes the saved
+// total honest enough for the planner to honour without cutting music.
+export function minimumSpokenTargetMinutes(musicBreaks: number): number {
+  const breaks = Math.max(0, Math.trunc(Number(musicBreaks) || 0));
+  return breaks * SPOKEN_ASSUMED_SONG_MINUTES
+    + (breaks + 1) * SPOKEN_MIN_UNIT_MINUTES;
+}
+
+export interface SpokenProgrammeConfig {
+  enabled: boolean;
+  format: SpokenFormat;
+  prompt: string;
+  targetMinutes: number;
+  useWeb: boolean;
+  musicBreaks: number;
+}
+
+export const DEFAULT_SPOKEN_PROGRAMME: SpokenProgrammeConfig = {
+  enabled: false,
+  format: 'custom',
+  prompt: '',
+  targetMinutes: 30,
+  useWeb: false,
+  musicBreaks: 1,
+};
+
+// Lenient load-path coercion for old/hand-edited schedule.json files. Strict
+// saves are validated in validate.ts; boot must never be wedged by this block.
+export function coerceSpokenProgramme(raw: unknown): SpokenProgrammeConfig {
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_SPOKEN_PROGRAMME };
+  const r = raw as Record<string, unknown>;
+  const format = SPOKEN_FORMATS.includes(r.format as SpokenFormat)
+    ? (r.format as SpokenFormat)
+    : DEFAULT_SPOKEN_PROGRAMME.format;
+  const targetRaw = Number(r.targetMinutes);
+  const targetMinutes = Number.isFinite(targetRaw)
+    ? Math.min(SPOKEN_TARGET_MINUTES_MAX, Math.max(SPOKEN_TARGET_MINUTES_MIN, Math.trunc(targetRaw)))
+    : DEFAULT_SPOKEN_PROGRAMME.targetMinutes;
+  const breaksRaw = Number(r.musicBreaks);
+  const requestedMusicBreaks = Number.isFinite(breaksRaw)
+    ? Math.min(SPOKEN_MUSIC_BREAKS_MAX, Math.max(0, Math.trunc(breaksRaw)))
+    : DEFAULT_SPOKEN_PROGRAMME.musicBreaks;
+  const maxBreaksForDuration = Math.max(0, Math.floor(
+    (targetMinutes - SPOKEN_MIN_UNIT_MINUTES)
+      / (SPOKEN_ASSUMED_SONG_MINUTES + SPOKEN_MIN_UNIT_MINUTES),
+  ));
+  const musicBreaks = Math.min(requestedMusicBreaks, maxBreaksForDuration);
+  return {
+    enabled: r.enabled === true,
+    format,
+    prompt: typeof r.prompt === 'string' ? r.prompt.trim().slice(0, SPOKEN_PROMPT_MAX) : '',
+    targetMinutes,
+    useWeb: r.useWeb === true || format === 'current-events',
+    musicBreaks,
+  };
+}
 // Guest co-hosts per show. Small on purpose: each guest is a full persona the
 // speaker rotation can hand a segment to, and past ~3 the host stops sounding
 // like the host.
@@ -886,6 +955,7 @@ export interface NormalizedShow {
   banter: boolean;
   programme: boolean;
   segmentSkill: string;
+  spoken: SpokenProgrammeConfig;
   moods: string[];
   themeId: string;
   genres: string[];

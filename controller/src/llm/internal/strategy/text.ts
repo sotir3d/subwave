@@ -5,6 +5,7 @@
 // primary→fallback switch across different providers picks the right path.
 
 import { generateText } from 'ai';
+import { withLlmAdmission } from '../core/admission.js';
 import { withFailover } from '../core/failover.js';
 import { withTransientRetry } from '../core/retry.js';
 import { stripThinking, truncationError, usageOf, perfOf, warningsOf, failureDiagnostics } from '../core/pure.js';
@@ -28,54 +29,63 @@ export async function djText({
   seed = null,
   maxOutputTokens = resolveMaxOutputTokens(MAX_TOKENS_TEXT),
   kind = 'sdk.djText',
-  // Optional caller-supplied abort signal. No live caller wraps djText in
-  // withDeadline today, so this is inert unless one starts to — kept in the
-  // shape as a precaution so a future deadline-wrapped call can cut the
-  // Retry-After sleep short and prevent a ghost retry after the abort (mirrors
-  // djAgent's threading, PR #751 review).
+  // Station-wide admission metadata. Lower priorities run first; calls at the
+  // same priority remain FIFO. neededBy only drops a queued call when
+  // dropIfLate is true.
+  priority = undefined,
+  neededBy = undefined,
+  dropIfLate = false,
+  // Optional caller-supplied abort signal. Admission removes an aborted queued
+  // call; once active it also reaches the transport and cuts transient-retry
+  // backoff short.
   signal = undefined,
 }: any): Promise<string> {
-  return withFailover(
-    kind,
-    (err) => ({ user: prompt, ...failureDiagnostics(err) }),
-    async (leg) => {
-      const result = await withTransientRetry(kind, () => generateText({
-        model: leg.model,
-        instructions: system,
-        prompt,
-        temperature,
-        topP,
-        ...(seed != null ? { seed } : {}),
-        maxOutputTokens,
-        reasoning: reasoningFor(leg.cfg),
-        ...(signal ? { abortSignal: signal } : {}),
-      }), signal);
-      // A free-text DJ script that hit the output-token cap is never a usable
-      // reply — real scripts run ~150 tokens against the 4000-token backstop,
-      // so 'length' means a reasoning model ran away mid-thought (issue #947:
-      // it tied up the TTS GPU for minutes). Fail the call instead —
-      // announce-path callers catch and skip the segment, so the station
-      // stays on air, just without this talk break.
-      const truncated = truncationError(result);
-      if (truncated) throw truncated;
-      const out = stripThinking(result.text);
-      // Only record sampling knobs that actually reached the model — see
-      // repeatPenaltyApplies() (currently false everywhere: ai-sdk-ollama v4
-      // lost the per-call channel) and samplingWithLocalKnobs() for the
-      // body-injection providers.
-      const sampling: any = { temperature, top_p: topP, seed };
-      if (repeatPenaltyApplies(leg.cfg)) sampling.repeat_penalty = repeatPenalty;
-      samplingWithLocalKnobs(leg.cfg, sampling);
-      return {
-        value: out,
-        via: 'ai-sdk',
-        sampling,
-        usage: usageOf(result),
-        perf: perfOf(result),
-        warnings: warningsOf(result),
-        // Full, untruncated — the /debug surface shows the whole system prompt.
-        extra: { system, user: prompt, response: out },
-      };
-    },
+  return withLlmAdmission(
+    { kind, priority, neededBy, dropIfLate, signal },
+    () => withFailover(
+      kind,
+      (err) => ({ user: prompt, ...failureDiagnostics(err) }),
+      async (leg) => {
+        const result = await withTransientRetry(kind, () => generateText({
+          model: leg.model,
+          instructions: system,
+          prompt,
+          temperature,
+          topP,
+          ...(seed != null ? { seed } : {}),
+          maxOutputTokens,
+          reasoning: reasoningFor(leg.cfg),
+          ...(signal ? { abortSignal: signal } : {}),
+        }), signal);
+        // A free-text DJ script that hit the output-token cap is never a usable
+        // reply — real scripts run ~150 tokens against the 4000-token backstop,
+        // so 'length' means a reasoning model ran away mid-thought (issue #947:
+        // it tied up the TTS GPU for minutes). Fail the call instead —
+        // announce-path callers catch and skip the segment, so the station
+        // stays on air, just without this talk break.
+        const truncated = truncationError(result);
+        if (truncated) throw truncated;
+        const out = stripThinking(result.text);
+        // Only record sampling knobs that actually reached the model — see
+        // repeatPenaltyApplies() (currently false everywhere: ai-sdk-ollama v4
+        // lost the per-call channel) and samplingWithLocalKnobs() for the
+        // body-injection providers.
+        const sampling: any = { temperature, top_p: topP, seed };
+        if (repeatPenaltyApplies(leg.cfg)) sampling.repeat_penalty = repeatPenalty;
+        samplingWithLocalKnobs(leg.cfg, sampling);
+        return {
+          value: out,
+          via: 'ai-sdk',
+          sampling,
+          usage: usageOf(result),
+          perf: perfOf(result),
+          warnings: warningsOf(result),
+          // Full, untruncated — the /debug surface shows the whole system prompt.
+          extra: { system, user: prompt, response: out },
+        };
+      },
+      undefined,
+      signal,
+    ),
   );
 }

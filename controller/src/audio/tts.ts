@@ -35,6 +35,7 @@ export const VOICE_KINDS = [
   'curiosity',      // on-this-day / oddly-specific factoid (segment capability)
   'album-anniversary', // round-number anniversary of the on-air album (segment capability)
   'library-deep-cut',  // tease a forgotten track by the on-air artist (segment capability)
+  'longform',       // listener-triggered spoken programme chapters
   'jingle',         // pre-rendered station idents (offline path)
   'default',        // fallback when a kind isn't explicitly mapped
 ];
@@ -119,6 +120,24 @@ function resolveEngine(kind: string, personaTts: any) {
     return tts.defaultEngine && tts.defaultEngine !== chosen ? tts.defaultEngine : 'piper';
   }
   return chosen;
+}
+
+// Read-only preflight for demand-driven producers. Long-form generation must
+// wait for the voice the show actually selected instead of silently filling a
+// half-hour feature with Piper, so it needs the same routing decision speak()
+// will make without starting a render.
+export function ttsRouteReadiness(
+  kind = 'longform',
+  persona?: any,
+): { requested: string; resolved: string; ready: boolean } {
+  const personaTts = djPersonaTts(kind, persona);
+  const requested = requestedEngine(kind, personaTts);
+  const resolved = resolveEngine(kind, personaTts);
+  return {
+    requested,
+    resolved,
+    ready: requested === resolved && engineUsable(requested, personaCloudProvider(personaTts)),
+  };
 }
 
 // Ordered runtime rescues after `primary` threw mid-render (cloud API 500,
@@ -335,7 +354,23 @@ export async function synthesizeSample(
 // admin Stats page can show per-engine usage, latency, and the fallback rate.
 export async function speak(
   text: string,
-  { kind = 'default', outPath, speedScale, persona }: { kind?: string; outPath?: string; speedScale?: number; persona?: any } = {},
+  {
+    kind = 'default', outPath, speedScale, persona, allowFallback = true,
+    applyFades = true, signal,
+  }: {
+    kind?: string;
+    outPath?: string;
+    speedScale?: number;
+    persona?: any;
+    /** Long-form production sets this false: if its selected resident neural
+     * voice is still loading, keep playing music instead of silently rendering
+     * a half-hour episode with the emergency Piper voice. */
+    allowFallback?: boolean;
+    /** Chunked long-form rendering disables this and applies one fade to the
+     * assembled chapter, avoiding an audible dip at every internal join. */
+    applyFades?: boolean;
+    signal?: AbortSignal;
+  } = {},
 ) {
   // Belt-and-suspenders scrub of any leaked reasoning at the single point every
   // booth-bound string converges (follow-up to #949). The free-text generators
@@ -391,19 +426,42 @@ export async function speak(
     text: (speakText || '').slice(0, 240),
     persona: GLOBAL_VOICE_KINDS.has(kind) ? null : (personaFor(persona)?.name || null),
   };
+  if (!allowFallback && requested !== primary) {
+    const unavailable = new Error(`requested TTS engine "${requested}" is unavailable`);
+    recordTts({
+      ...callBase, engine: requested, fellBack: false, ok: false, ms: 0,
+      error: unavailable.message, t: new Date().toISOString(),
+    });
+    throw unavailable;
+  }
   try {
-    const result = await speakWith(primary, speakText, { outPath, speedScale: scale, language, soul }, personaTts);
+    const result = await speakWith(primary, speakText, {
+      outPath,
+      speedScale: scale,
+      language,
+      soul,
+      signal,
+      strictVoice: !allowFallback,
+    }, personaTts);
     // Bake 40ms edge fades into the rendered clip so hard file boundaries
     // never reach the broadcast compressor as a click. Render time is the only
     // place the tail can be faded — see audio/wav-edges.ts. Best-effort:
     // non-WAV output (cloud mp3) is left as-is.
-    if (typeof result === 'string') await applyEdgeFades(result);
+    if (applyFades && typeof result === 'string') await applyEdgeFades(result);
     recordTts({
       ...callBase, engine: primary, fellBack: requested !== primary,
       ok: true, ms: Date.now() - started, t: new Date().toISOString(),
     });
     return result;
   } catch (err) {
+    if (!allowFallback) {
+      recordTts({
+        ...callBase, engine: primary, fellBack: false,
+        ok: false, ms: Date.now() - started, error: err.message,
+        t: new Date().toISOString(),
+      });
+      throw err;
+    }
     // The primary passed the pre-flight gate but threw mid-render. Walk the
     // rescue chain — configured default engine, then Piper, then Kokoro — so
     // the DJ never goes silent because one provider hiccuped.
@@ -430,8 +488,10 @@ export async function speak(
         // provider/voice instead of the station default's credentials the
         // chain probe just validated. Null keeps probe and call in agreement.
         // The persona's `language`/`soul` hints still ride via opts.
-        const result = await speakWith(fallback, speakText, { outPath, speedScale: scale, language, soul }, null);
-        if (typeof result === 'string') await applyEdgeFades(result);
+        const result = await speakWith(fallback, speakText, {
+          outPath, speedScale: scale, language, soul, signal, strictVoice: false,
+        }, null);
+        if (applyFades && typeof result === 'string') await applyEdgeFades(result);
         recordTts({
           ...callBase, engine: fallback, fellBack: true,
           ok: true, ms: Date.now() - started, t: new Date().toISOString(),

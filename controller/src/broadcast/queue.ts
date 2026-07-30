@@ -33,7 +33,7 @@ import { getFullContext, energyForDaypart } from '../context.js';
 import * as settings from '../settings.js';
 import { logEvent } from '../observability/events.js';
 import { djCallsAllowed, presentListeners } from './listeners.js';
-import { autoVoiceAllowed } from './voice-policy.js';
+import { autoVoiceAllowed, timelineVoiceBlocked } from './voice-policy.js';
 import * as webhooks from './webhooks.js';
 import * as scrobble from './scrobble.js';
 import * as liquidsoapControl from './liquidsoap-control.js';
@@ -76,8 +76,19 @@ import {
   VOICE_LEADIN_MS,
   airVoice,
   speechDurationMs,
+  waitForVoiceIdle,
   writeHandoff,
 } from './queue/voice-io.js';
+import {
+  parseTalkPlaybackMarker,
+  parseTalkMixerEpoch,
+  talkMixerEpochFile,
+  talkPlayingFile,
+  talkTimelineUri,
+  talkTrackId,
+  type TalkPlaybackMarker,
+  type TalkTimelineInput,
+} from './queue/talk.js';
 
 // Re-exported so every existing `from './queue.js'` import keeps working.
 export { BACKFILL_DEDUP_MAX_GAP_MS, playAlreadyRecorded, shouldDropStaleLink } from './queue/pure.js';
@@ -93,6 +104,7 @@ class Queue {
   lastSeenKey: string | null = null;   // for change detection in the watcher
   _nowPlaying: NowPlaying | null = null;   // last parse of now-playing.json, refreshed by the watcher
   _nowPlayingFresh = false;            // true once the watcher's first tick has landed
+  _talkPlayback: TalkPlaybackMarker | null = null; // start/finish acknowledgement written atomically by radio.liq
   senderBusy = false;          // drain-to-Liquidsoap mutex
   pendingForceDrain = false;   // a forced drain arrived while senderBusy — re-run on release
   pickerBusy = false;          // prevent concurrent LLM picks
@@ -109,6 +121,7 @@ class Queue {
   _emptyDjQueueStreak = 0;      // consecutive reconcile checks seeing an empty dj_queue while sent items remain — see reconcileWithDjQueue
   _deadlinePickAt = 0;          // last deadline-pick ATTEMPT (ms epoch) — failure-retry cooldown, see maybeDeadlinePick
   _pendingVoice: { text: string; kind: string; wavPath: string; persona: Persona | null; meta: TurnMeta; t: number } | null = null; // one boundary-deferred segment awaiting the next track start — see announceAtNextTrack
+  _cancelledTalkIds = new Set<string>(); // schedule/operator stop raced a talk already being prepared by Liquidsoap
 
   // Snapshot upcoming/current/history to disk. The queue is otherwise purely
   // in-memory, so a controller restart (every `--build controller` rebuild)
@@ -168,7 +181,9 @@ class Queue {
       this.history = Array.isArray(stored.history) ? stored.history : [];
       if (this.current?.track) {
         const t = this.current.track;
-        this.lastSeenKey = `${t.id || ''}|${t.title}|${t.artist || ''}`;
+        this.lastSeenKey = this.current.kind === 'talk'
+          ? `${t.id || ''}|${this.current.talk?.id || ''}|${t.title}|${t.artist || ''}`
+          : `${t.id || ''}||${t.title}|${t.artist || ''}`;
       }
       this.log('scheduler',
         `Queue recovered: ${this.upcoming.length} upcoming, ${this.history.length} played`);
@@ -423,6 +438,7 @@ class Queue {
       }
     }
     const item = {
+      kind: 'track' as const,
       track, requestedBy, intent, introScript, introKind, introPersona, aiPicked,
       // Only stamp a back-announce target when there's actually an intro/link to
       // air against it; a bare track carries no claim about what preceded it.
@@ -442,12 +458,70 @@ class Queue {
     return this.upcoming.length;
   }
 
+  // Put one pre-rendered spoken chapter into the main playout timeline.
+  // Unlike announce(), this never touches say.txt/intro.txt and therefore can
+  // never be ducked over a song.  It enters the same upcoming -> next.txt ->
+  // request.queue path as music, preserving the single-writer/FIFO contract.
+  //
+  // At most one talk item may be pending. While a talk is already on air that
+  // single successor may be prefetched, which permits a seamless talk -> talk
+  // edge. A second pending item is rejected so the rolling producer cannot
+  // flood Liquidsoap's request queue or outrun its durable acknowledgements.
+  async enqueueTalk(input: Omit<TalkTimelineInput, 'id'> & { id?: string; signal?: AbortSignal }): Promise<
+    | { ok: true; id: string; queueDepth: number }
+    | { ok: false; reason: 'busy' | 'missing-file'; activeId?: string }
+  > {
+    // A short ident/link may already have crossed the handoff boundary before
+    // the long-form runtime acquired its mic lease. Let that clip finish before
+    // the chapter enters the main timeline; otherwise the two Liquidsoap buses
+    // can still overlap for its remaining seconds.
+    await waitForVoiceIdle(input.signal);
+    const pending = this.upcoming.find(i => i.kind === 'talk');
+    if (pending) {
+      return { ok: false, reason: 'busy', activeId: pending.talk?.id };
+    }
+    if (!existsSync(input.wavPath)) {
+      this.log('error', `Talk WAV missing; music fallback left untouched: ${input.wavPath}`);
+      return { ok: false, reason: 'missing-file' };
+    }
+
+    // A caller-provided manifest id is preferred for restart-safe correlation.
+    // The timestamp/random suffix is only a convenience for manual callers.
+    const id = input.id?.trim()
+      || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const title = input.title.trim() || 'Spoken word';
+    const speaker = input.speaker?.trim() || null;
+    const item: QueueItem = {
+      kind: 'talk',
+      talk: { id, wavPath: input.wavPath, gainDb: input.gainDb },
+      track: {
+        id: talkTrackId(id),
+        title,
+        artist: speaker,
+        album: 'Spoken word',
+        duration: input.durationSec ?? null,
+      },
+      requestedBy: null,
+      queuedAt: new Date().toISOString(),
+      sent: false,
+      confirmedInLiquidsoap: false,
+    };
+    this.upcoming.push(item);
+    this.log('talk-queued', `Queued spoken chapter: ${title}${speaker ? ` — ${speaker}` : ''}`, {
+      talkId: id,
+      queueDepth: this.upcoming.length,
+    });
+    this.persist();
+    void this.drainToLiquidsoap();
+    return { ok: true, id, queueDepth: this.upcoming.length };
+  }
+
   // Drop now-blocked tracks from the upcoming queue — called when a blocklist
   // entry is added. Only undrained items (`!sent`) are removable; anything
   // already handed to Liquidsoap plays out (we never interrupt), and the
   // currently playing track is likewise left alone. Returns how many dropped.
   purgeBlocked(): number {
-    const keep = this.upcoming.filter(i => i.sent || !blocklist.isBlocked(i.track));
+    const keep = this.upcoming.filter(i => i.kind === 'talk' || i.sent || !blocklist.isBlocked(i.track));
     const dropped = this.upcoming.length - keep.length;
     if (dropped > 0) {
       this.upcoming = keep;
@@ -1021,7 +1095,9 @@ class Queue {
         // caught live in the first on-air smoke test.
         // `force` is the clip-as-track recovery path (onTrackStarted's guard):
         // never hold, but a known successor still earns its pair stamps.
-        const action = force
+        const action = item.kind === 'talk'
+          ? 'send-intrinsic'
+          : force
           ? (hasSuccessor ? 'send-pair' : 'send-intrinsic')
           : drainAction({
               pairDrain: this.pairDrainActive(),
@@ -1029,6 +1105,33 @@ class Queue {
               remainingSec: this.remainingUntilItemAirs(item),
             });
         if (action === 'hold') break;
+
+        // Standalone spoken-word item: hand the already-rendered WAV to the
+        // same request.queue seam as music.  No TTS, loudness lookup, bed,
+        // transition effect, or say.txt/intro.txt overlay participates.  A
+        // vanished render is dropped before handoff, so Liquidsoap simply
+        // keeps playing its auto.m3u fallback rather than opening dead air.
+        if (item.kind === 'talk') {
+          const talk = item.talk;
+          if (!talk || !existsSync(talk.wavPath)) {
+            this.upcoming.splice(this.upcoming.indexOf(item), 1);
+            this.log('error', `Talk WAV disappeared before handoff; continuing with music: ${talk?.wavPath || '(unknown)'}`);
+            this.persist();
+            continue;
+          }
+          const uri = talkTimelineUri({
+            id: talk.id,
+            wavPath: talk.wavPath,
+            title: item.track.title || 'Spoken word',
+            speaker: item.track.artist,
+            durationSec: item.track.duration,
+            gainDb: talk.gainDb,
+          });
+          await writeHandoff(config.liquidsoap.queueFile, uri, { maxWaitMs: 5000 });
+          item.sent = true;
+          this.persist();
+          continue;
+        }
 
         // Render the track's intro/link WAV ahead of time but DON'T air it here
         // — airing now would play it over whatever's currently on-air, one (or
@@ -1202,8 +1305,12 @@ class Queue {
   // default to absent, so every existing call site is byte-identical.
   async announce(text, kind = 'announcement', { persona = null, meta = {} }: { persona?: Persona | null; meta?: TurnMeta } = {}) {
     if (!text || !text.trim()) return;
+    if (timelineVoiceBlocked()) return;
     try {
       const wavPath = await speak(text, { kind, persona });
+      // The long-form lease can be acquired while TTS is rendering. Drop the
+      // now-stale clip before it reaches either overlay handoff.
+      if (timelineVoiceBlocked()) return;
       const targetFile = kind === 'link'
         ? config.liquidsoap.introFile
         : config.liquidsoap.sayFile;
@@ -1229,9 +1336,11 @@ class Queue {
   // logged speaker-prefixed and appended to the session tagged with its
   // speaker, so windowMessages names a guest's words as theirs.
   async announceExchange(lines: { persona: Persona; text: string }[], kind = 'banter') {
+    if (timelineVoiceBlocked()) return false;
     const rendered: { persona: Persona; text: string; wavPath: string }[] = [];
     try {
       for (const l of lines) {
+        if (timelineVoiceBlocked()) return false;
         const wavPath = await speak(l.text, { kind, persona: l.persona });
         rendered.push({ ...l, wavPath });
       }
@@ -1240,6 +1349,7 @@ class Queue {
       return false;
     }
     for (const l of rendered) {
+      if (timelineVoiceBlocked()) return false;
       try {
         await airVoice(config.liquidsoap.sayFile, l.wavPath, l.text, voiceGainDb(kind, l.persona));
         this.log(kind, `${l.persona?.name ? `${l.persona.name}: ` : ''}${l.text}`);
@@ -1275,8 +1385,10 @@ class Queue {
   // actually reached the stream, not what was merely scheduled.
   async announceAtNextTrack(text, kind = 'announcement', { persona = null, meta = {} }: { persona?: Persona | null; meta?: TurnMeta } = {}) {
     if (!text || !text.trim()) return;
+    if (timelineVoiceBlocked()) return;
     try {
       const wavPath = await speak(text, { kind, persona });
+      if (timelineVoiceBlocked()) return;
       this._pendingVoice = { text, kind, wavPath, persona, meta, t: Date.now() };
       this.log('scheduler', `Holding ${kind} for the next track boundary`);
     } catch (err) {
@@ -1302,6 +1414,10 @@ class Queue {
   // PENDING_VOICE_MAX_AGE_MS (a long mix, a stream stall) is dropped rather
   // than aired with a stale time reference — the next cron fire replaces it.
   async airPendingVoice() {
+    if (timelineVoiceBlocked()) {
+      this.dropPendingVoice('a long-form timeline programme owns the microphone');
+      return;
+    }
     // A mic-pass is already pending from an earlier roll (the hourly cron rolls
     // without airing) and will take this boundary. The same-tick case — where
     // the roll happens in onTrackStarted's auto-pick block, AFTER this runs —
@@ -1339,8 +1455,14 @@ class Queue {
     // skip writing intros, so this only catches an item queued BEFORE the
     // switch was flipped — it must not air its script now. Backstop, not the
     // policy: nothing here spends tokens, so a plain drop is the whole job.
-    if (!autoVoiceAllowed()) return;
     if (!item || item.introAired) return;
+    if (!autoVoiceAllowed()) {
+      // This boundary has passed; keeping the flag false would leave a stale
+      // rendered line looking eligible after the long-form block ends.
+      item.introAired = true;
+      this.persist();
+      return;
+    }
     if (!item.introWav && !item.introScript) return;
     item.introAired = true;
     // Stale back-announce safety-net. Links are written forward-looking (intro
@@ -1383,6 +1505,10 @@ class Queue {
       }
     }
     const kind = item.introKind || 'dj-speak';
+    // The timeline owner can arrive while an expired/missing intro is being
+    // re-rendered above. Do not let that race hand stale overlay audio to the
+    // mixer after long-form speech has claimed the microphone.
+    if (timelineVoiceBlocked()) return;
     const targetFile = kind === 'link'
       ? config.liquidsoap.introFile
       : config.liquidsoap.sayFile;
@@ -1422,6 +1548,7 @@ class Queue {
   // instead of during the channel's silent pre-roll. Transition stingers leave
   // it false — they have no voice to align to and must fire at the crossfade.
   async playSfx(name: string, { underVoice = false }: { underVoice?: boolean } = {}) {
+    if (timelineVoiceBlocked()) return;
     if (!name) return;
     try {
       const path = await sfx.getPath(name);
@@ -1441,8 +1568,21 @@ class Queue {
   // Called by the now-playing watcher when Liquidsoap reports a new track.
   onTrackStarted(np: NowPlaying | null) {
     if (!np || !np.title) return;
-    const key = `${np.subsonic_id || ''}|${np.title}|${np.artist || ''}`;
+    const isTalk = np.subwave_kind === 'talk';
+    const key = `${np.subsonic_id || ''}|${np.talk_id || ''}|${np.title}|${np.artist || ''}`;
     if (key === this.lastSeenKey) return;
+
+    if (isTalk && np.talk_id && this._cancelledTalkIds.delete(np.talk_id)) {
+      this.lastSeenKey = key;
+      const index = this.upcoming.findIndex(item => item.kind === 'talk' && item.talk?.id === np.talk_id);
+      if (index >= 0) this.upcoming.splice(index, 1);
+      this.persist();
+      this.log('longform', `Skipping cancelled spoken chapter ${np.talk_id}`);
+      void liquidsoapControl.skipTrack().catch((error) => {
+        this.log('error', `Could not skip cancelled spoken chapter: ${(error as Error).message}`);
+      });
+      return;
+    }
 
     // Stem-blend safety guard: metadata matching a NOT-YET-SENT upcoming item
     // means a rendered clip annotated as that track is airing while the track
@@ -1453,7 +1593,7 @@ class Queue {
     // air. Force-drain it NOW (bypassing the pair hold) and leave this fire
     // unprocessed — lastSeenKey stays unset, so the track's REAL fire (same
     // key) re-enters and the normal consume path takes over.
-    if (np.subsonic_id && this.upcoming.some(u => !u.sent && u.track.id === np.subsonic_id)) {
+    if (!isTalk && np.subsonic_id && this.upcoming.some(u => !u.sent && u.track.id === np.subsonic_id)) {
       this.log('scheduler', `"${np.title}" fired while its queue item was still unsent — force-draining it (clip-as-track guard)`);
       void this.drainToLiquidsoap(true);
       return;
@@ -1464,17 +1604,18 @@ class Queue {
     // ident) now. Fired BEFORE airIntro below so the shared voice chain plays
     // ident → link in that order. Fire-and-forget for the same reason as
     // airIntro: must not stall the watcher tick.
-    void this.airPendingVoice();
+    if (!isTalk) void this.airPendingVoice();
 
     // Snapshot the outgoing track BEFORE the history roll mutates `this.current`
     // — scrobble.onTrackEvent below needs the previous play + its start time
     // to compute eligibility against Last.fm's >50% / >4min rule.
-    const outgoingPrev = this.current
+    const outgoingWasTalk = this.current?.kind === 'talk';
+    const outgoingPrev = this.current && !outgoingWasTalk
       ? { track: this.current.track, startedAt: this.current.startedAt }
       : null;
 
     // Roll previous current into history
-    if (this.current) {
+    if (this.current && !outgoingWasTalk) {
       const endedAt = new Date().toISOString();
       this.history.unshift({ ...this.current, endedAt });
       this.history = this.history.slice(0, 50);
@@ -1497,7 +1638,10 @@ class Queue {
     // Match upcoming by subsonic_id first (reliable), fall back to title+artist
     // for older items that pre-date the id annotation.
     let idx = -1;
-    if (np.subsonic_id) {
+    if (isTalk && np.talk_id) {
+      idx = this.upcoming.findIndex(u => u.kind === 'talk' && u.talk?.id === np.talk_id);
+    }
+    if (idx < 0 && np.subsonic_id) {
       idx = this.upcoming.findIndex(u => u.track.id && u.track.id === np.subsonic_id);
     }
     if (idx < 0) {
@@ -1517,9 +1661,13 @@ class Queue {
           `Dropped ${idx} queue item(s) Liquidsoap played during the downtime`);
       }
       const item = consumed[consumed.length - 1];
-      const source = item.aiPicked ? 'ai' : 'request';
+      const source = item.kind === 'talk' ? 'talk' : item.aiPicked ? 'ai' : 'request';
       this.current = { ...item, startedAt: new Date().toISOString(), source };
-      this.log('playing', `${np.title} — ${np.artist}`, { requestedBy: item.requestedBy, source });
+      this.log(item.kind === 'talk' ? 'longform' : 'playing', `${np.title} — ${np.artist}`, {
+        requestedBy: item.requestedBy,
+        source,
+        talkId: item.talk?.id || null,
+      });
       // A tracked item matched → controller and Liquidsoap are in sync; clear any
       // dj_queue-empty desync streak accumulated from prior untracked plays.
       this._emptyDjQueueStreak = 0;
@@ -1527,7 +1675,7 @@ class Queue {
       // because the crossfade this stinger was sized for is airing right now.
       // Re-gated on the live toggle: the operator may have switched SFX off
       // in the minutes between drain and air.
-      if (item.transitionSfx && settings.get().sfx?.enabled) {
+      if (item.kind !== 'talk' && item.transitionSfx && settings.get().sfx?.enabled) {
         void this.playSfx(item.transitionSfx);
       }
       // Air this track's intro/link now that it's actually on-air — deferred
@@ -1538,7 +1686,9 @@ class Queue {
       // rolled into history — the REAL predecessor — so a back-announcing link
       // that no longer follows the track it names (a request jumped the queue)
       // is dropped instead of airing a stale name.
-      void this.airIntro(this.current, this.history[0]?.track || null);
+      if (item.kind !== 'talk') {
+        void this.airIntro(this.current, outgoingWasTalk ? null : this.history[0]?.track || null);
+      }
     } else {
       // Not a tracked request → auto-playlist or jingle.
       // If we see untracked plays while there are sent items in `upcoming`,
@@ -1548,6 +1698,10 @@ class Queue {
         void this.reconcileWithDjQueue();
       }
       this.current = {
+        kind: isTalk ? 'talk' : 'track',
+        talk: isTalk && np.talk_id
+          ? { id: np.talk_id, wavPath: typeof np.filename === 'string' ? np.filename : '' }
+          : null,
         track: {
           id: np.subsonic_id || null,
           title: np.title,
@@ -1556,9 +1710,46 @@ class Queue {
         },
         requestedBy: null,
         startedAt: new Date().toISOString(),
-        source: 'auto',
+        source: isTalk ? 'talk' : 'auto',
       };
-      this.log('playing', `${np.title} — ${np.artist}`, { source: 'auto' });
+      this.log(isTalk ? 'longform' : 'playing', `${np.title} — ${np.artist}`, {
+        source: isTalk ? 'talk' : 'auto', talkId: np.talk_id || null,
+      });
+    }
+
+    // A spoken chapter is a real playout boundary, not a music play. Keep it
+    // out of library history, recent-track guards, track webhooks and incoming
+    // scrobbles. The outgoing song still ended here, so submit that half of the
+    // scrobble event and record the spoken turn before returning.
+    if (this.current.kind === 'talk') {
+      session.appendTurn({
+        role: 'segment', kind: 'longform',
+        text: this.current.track.title || 'Spoken word',
+        meta: {
+          talkId: this.current.talk?.id || np.talk_id || null,
+          speaker: this.current.track.artist || null,
+        },
+      });
+      logEvent('talk.play', {
+        talkId: this.current.talk?.id || np.talk_id || null,
+        title: this.current.track.title || 'Spoken word',
+        speaker: this.current.track.artist || null,
+      });
+      scrobble.onTrackEvent({
+        outgoing: outgoingPrev?.track
+          ? {
+              id: outgoingPrev.track.id || null,
+              title: outgoingPrev.track.title || null,
+              artist: outgoingPrev.track.artist || null,
+              album: outgoingPrev.track.album || null,
+              duration: outgoingPrev.track.duration ?? null,
+            }
+          : null,
+        outgoingStartedAt: outgoingPrev?.startedAt || null,
+        incoming: null,
+      });
+      this.persist();
+      return;
     }
 
     // Record the play into the live session's chat history.
@@ -1652,7 +1843,11 @@ class Queue {
     // watcher still gets onTrackStarted events for those auto tracks, so the
     // first transition after a listener returns re-enters this block.
     const isAutonomous = this.current.source === 'auto' || this.current.source === 'ai';
-    if (this.autoPick && this.upcoming.length === 0 && !this.pickerBusy && djCallsAllowed()) {
+    if (this.autoPick
+        && !timelineVoiceBlocked()
+        && this.upcoming.length === 0
+        && !this.pickerBusy
+        && djCallsAllowed()) {
       this.runPickCycle({ isAutonomous });
     }
   }
@@ -1783,7 +1978,7 @@ class Queue {
   // pipeline ahead unbounded. Past the hard deadline the pick window closes
   // and drainToLiquidsoap's intrinsic path owns the endgame.
   maybeDeadlinePick() {
-    if (!this.autoPick || this.pickerBusy || !djCallsAllowed()) return;
+    if (!this.autoPick || timelineVoiceBlocked() || this.pickerBusy || !djCallsAllowed()) return;
     if (!this.pairDrainActive()) return;
     const rem = this.remainingSecOnAir();
     if (!shouldDeadlinePick(rem)) return;
@@ -1972,6 +2167,48 @@ class Queue {
   // a key-based fallback lets backfilled entries still block repeats. Walks
   // the rolling 24h sidecar (`_recentPlays`) newest-first to the cutoff and
   // also includes the current track so a mid-song pick can't re-pick it.
+  /** Remove every not-yet-aired chapter for an episode from both the Node and
+   * Liquidsoap queues. A request that Liquidsoap has already begun preparing
+   * is marked for an immediate skip when its metadata edge arrives. */
+  async cancelTalksForEpisode(
+    episodeId: string,
+    { skipPlaying = false }: { skipPlaying?: boolean } = {},
+  ): Promise<{ removed: number; markedForSkip: number; skippedCurrent: boolean }> {
+    const prefix = `${episodeId}:`;
+    const candidates = this.upcoming
+      .filter(item => item.kind === 'talk' && item.talk?.id?.startsWith(prefix))
+      .map(item => ({ id: item.talk!.id, trackId: item.track.id || talkTrackId(item.talk!.id) }));
+    let removed = 0;
+    let markedForSkip = 0;
+    for (const candidate of candidates) {
+      try {
+        const result = await this.removeUpcoming(candidate.trackId);
+        if (result.ok) {
+          removed += 1;
+          continue;
+        }
+      } catch (error) {
+        this.log('error', `Could not remove spoken chapter from Liquidsoap: ${(error as Error).message}`);
+      }
+      if (!this._cancelledTalkIds.has(candidate.id)) {
+        this._cancelledTalkIds.add(candidate.id);
+        markedForSkip += 1;
+      }
+    }
+
+    const currentId = this.current?.kind === 'talk' ? this.current.talk?.id || '' : '';
+    let skippedCurrent = false;
+    if (skipPlaying && currentId.startsWith(prefix)) {
+      try {
+        await liquidsoapControl.skipTrack();
+        skippedCurrent = true;
+      } catch (error) {
+        this.log('error', `Could not skip current spoken chapter: ${(error as Error).message}`);
+      }
+    }
+    return { removed, markedForSkip, skippedCurrent };
+  }
+
   recentlyPlayed(hours = 12) {
     const cutoff = Date.now() - hours * 3_600_000;
     const ids = new Set<string>();
@@ -2042,9 +2279,9 @@ class Queue {
 
   queuedIds(): Set<string> {
     const ids = new Set<string>();
-    if (this.current?.track?.id) ids.add(this.current.track.id);
+    if (this.current?.kind !== 'talk' && this.current?.track?.id) ids.add(this.current.track.id);
     for (const item of this.upcoming) {
-      if (item.track?.id) ids.add(item.track.id);
+      if (item.kind !== 'talk' && item.track?.id) ids.add(item.track.id);
     }
     return ids;
   }
@@ -2143,7 +2380,10 @@ class Queue {
   // per-listener /now-playing poll never has to touch the disk.
   startWatcher() {
     const tick = async () => {
-      this._nowPlaying = await this.readNowPlayingFromDisk();
+      [this._nowPlaying, this._talkPlayback] = await Promise.all([
+        this.readNowPlayingFromDisk(),
+        this.readTalkPlaybackFromDisk(),
+      ]);
       this._nowPlayingFresh = true;
       this.onTrackStarted(this._nowPlaying);
       // Beds ride the same tick rather than a poller of their own — a bed's
@@ -2177,6 +2417,8 @@ class Queue {
       endedAt: i.endedAt,
       queuedAt: i.queuedAt,
       sent: i.sent,
+      kind: i.kind || 'track',
+      talkId: i.talk?.id || null,
     });
     return {
       current: this.current ? mapItem(this.current) : null,
@@ -2186,6 +2428,7 @@ class Queue {
       autoPick: this.autoPick,
       autoLink: this.autoLink,
       pickerBusy: this.pickerBusy,
+      talkPlayback: this._talkPlayback ? { ...this._talkPlayback } : null,
     };
   }
 
@@ -2211,6 +2454,43 @@ class Queue {
     } catch {
       return null;
     }
+  }
+
+  // Liquidsoap's atomic start/finish acknowledgement for the current or most
+  // recently-finished timeline talk item.  Exposed separately from
+  // now-playing so the producer can advance its persistent chapter state even
+  // if no web client is polling.
+  getTalkPlayback() {
+    return this._talkPlayback ? { ...this._talkPlayback } : null;
+  }
+
+  async readTalkPlaybackFromDisk(): Promise<TalkPlaybackMarker | null> {
+    try {
+      return parseTalkPlaybackMarker(await readFile(talkPlayingFile(), 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+
+  async readTalkMixerEpochFromDisk(): Promise<string | null> {
+    try {
+      return parseTalkMixerEpoch(await readFile(talkMixerEpochFile(), 'utf8'))?.epoch || null;
+    } catch {
+      return null;
+    }
+  }
+
+  invalidateTalkQueueForMixerRestart(): number {
+    const before = this.upcoming.length;
+    this.upcoming = this.upcoming.filter(item => item.kind !== 'talk');
+    const removed = before - this.upcoming.length;
+    if (this.current?.kind === 'talk') this.current = null;
+    this._talkPlayback = null;
+    this._cancelledTalkIds.clear();
+    this.lastSeenKey = '';
+    if (removed > 0) this.log('longform', `Dropped ${removed} stale talk queue item(s) after mixer restart`);
+    this.persist();
+    return removed;
   }
 }
 

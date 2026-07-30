@@ -8,6 +8,7 @@ import express from 'express';
 import { config } from '../../config.js';
 import * as settings from '../../settings.js';
 import * as llmProvider from '../../llm/provider.js';
+import { LLM_ADMISSION_PRIORITY, withLlmAdmission } from '../../llm/sdk.js';
 import { probeEmbeddingConfig } from '../../music/embeddings.js';
 import { requireAdmin } from '../../middleware/auth.js';
 import { SECRET_ENV_KEYS } from '../../setup/secrets.js';
@@ -22,6 +23,18 @@ import { fetchWithTimeout } from '../../util/fetch-timeout.js';
 
 // Mounted onto the parent settings router in ../settings.ts.
 export const router = express.Router();
+
+function runOperatorLlmProbe<T>(
+  kind: string,
+  timeoutMs: number,
+  task: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const signal = AbortSignal.timeout(timeoutMs);
+  return withLlmAdmission(
+    { kind, priority: LLM_ADMISSION_PRIORITY.listener, signal },
+    () => task(signal),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // probeKey — non-mutating live probe for a single secret key.
@@ -77,7 +90,8 @@ async function probeKey(
       try {
         const model = activeModel('anthropic') || 'claude-haiku-4-5-20251001';
         const m = createAnthropic({ apiKey: value })(model);
-        await generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: AbortSignal.timeout(15000) });
+        await runOperatorLlmProbe('operator.probe-anthropic-key', 15_000, (signal) =>
+          generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: signal }));
         return { ok: true, message: `✓ Anthropic key valid · model responded` };
       } catch (err) { return { ok: false, message: briefLlmError(err) }; }
     }
@@ -85,7 +99,8 @@ async function probeKey(
       try {
         const model = activeModel('openai') || 'gpt-4o-mini';
         const m = createOpenAI({ apiKey: value })(model);
-        await generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: AbortSignal.timeout(15000) });
+        await runOperatorLlmProbe('operator.probe-openai-key', 15_000, (signal) =>
+          generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: signal }));
         return { ok: true, message: `✓ OpenAI key valid · model responded` };
       } catch (err) { return { ok: false, message: briefLlmError(err) }; }
     }
@@ -93,7 +108,8 @@ async function probeKey(
       try {
         const model = activeModel('google') || 'gemini-1.5-flash';
         const m = createGoogleGenerativeAI({ apiKey: value })(model);
-        await generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: AbortSignal.timeout(15000) });
+        await runOperatorLlmProbe('operator.probe-google-key', 15_000, (signal) =>
+          generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: signal }));
         return { ok: true, message: `✓ Google key valid · model responded` };
       } catch (err) { return { ok: false, message: briefLlmError(err) }; }
     }
@@ -101,7 +117,8 @@ async function probeKey(
       try {
         const model = activeModel('deepseek') || 'deepseek-chat';
         const m = createDeepSeek({ apiKey: value })(model);
-        await generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: AbortSignal.timeout(15000) });
+        await runOperatorLlmProbe('operator.probe-deepseek-key', 15_000, (signal) =>
+          generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: signal }));
         return { ok: true, message: `✓ DeepSeek key valid · model responded` };
       } catch (err) { return { ok: false, message: briefLlmError(err) }; }
     }
@@ -109,7 +126,8 @@ async function probeKey(
       try {
         const model = activeModel('openrouter') || 'openai/gpt-4o-mini';
         const m = createOpenRouter({ apiKey: value, headers: llmProvider.OPENROUTER_APP_HEADERS })(model);
-        await generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: AbortSignal.timeout(15000) });
+        await runOperatorLlmProbe('operator.probe-openrouter-key', 15_000, (signal) =>
+          generateText({ model: m, prompt: 'Reply with the single word OK.', maxOutputTokens: 32, abortSignal: signal }));
         return { ok: true, message: `✓ OpenRouter key valid · model responded` };
       } catch (err) { return { ok: false, message: briefLlmError(err) }; }
     }
@@ -299,12 +317,13 @@ router.post('/settings/llm/probe-compat', requireAdmin, async (req, res) => {
       apiKey: resolvedApiKey || 'no-key',
       baseURL: baseUrl.trim().replace(/\/+$/, ''),
     }).chat(model.trim());
-    await generateText({
-      model: m,
-      prompt: 'Reply with the single word OK.',
-      maxOutputTokens: 32,
-      abortSignal: AbortSignal.timeout(15000),
-    });
+    await runOperatorLlmProbe('operator.probe-openai-compatible', 15_000, (signal) =>
+      generateText({
+        model: m,
+        prompt: 'Reply with the single word OK.',
+        maxOutputTokens: 32,
+        abortSignal: signal,
+      }));
     res.json({ ok: true, message: '✓ Bearer token accepted · model responded', latencyMs: Date.now() - t0 });
   } catch (err: unknown) {
     res.json({ ok: false, message: briefLlmError(err), latencyMs: Date.now() - t0 });

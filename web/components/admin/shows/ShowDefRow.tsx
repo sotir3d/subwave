@@ -84,12 +84,15 @@ export function ShowDefRow({ show: s, index: i, ok, hrs, host, guests, apiBase, 
           <div className="flex items-start gap-3">
             {/* name + roster */}
             <div className="min-w-0 flex-1">
-              {(s.programme || (s.banter && guests.length > 0)) && (
+              {(s.programme || s.spoken.enabled || (s.banter && guests.length > 0)) && (
                 <div className="mb-1 flex flex-wrap items-center gap-1.5">
                   {s.programme && (
                     <Pill tone="solid" dot>
                       Programme{skillPin ? ` · ${skillPin}` : ''}
                     </Pill>
+                  )}
+                  {s.spoken.enabled && (
+                    <Pill tone="accent">Spoken · {s.spoken.targetMinutes}m</Pill>
                   )}
                   {s.banter && guests.length > 0 && <Pill>Banter</Pill>}
                 </div>

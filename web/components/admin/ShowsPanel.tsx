@@ -234,6 +234,10 @@ export default function ShowsPanel() {
           filtersStrict: false, maxTrackSeconds: null,
           playlistIds: [], playlistStrict: false, excludedPlaylistIds: [],
           programme: false, segmentSkill: '',
+          spoken: {
+            enabled: false, format: 'custom', prompt: '', targetMinutes: 30,
+            useWeb: false, musicBreaks: 1,
+          },
         }],
       };
     });

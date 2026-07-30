@@ -83,7 +83,7 @@ export function defineAgent(def: AgentDefinition): DjAgentInstance {
     },
     temperature: def.temperature,
     maxOutputTokens: def.maxOutputTokens,
-    async run({ messages, ...toolArgs }) {
+    async run({ messages, priority, neededBy, dropIfLate, signal, ...toolArgs }) {
       const system = def.buildSystem(toolArgs);
       const built = def.buildTools ? def.buildTools(toolArgs) : { tools: undefined, extras: undefined };
       const result = await djAgent({
@@ -96,6 +96,10 @@ export function defineAgent(def: AgentDefinition): DjAgentInstance {
         temperature: def.temperature,
         maxOutputTokens: def.maxOutputTokens,
         kind: def.kind,
+        priority,
+        neededBy,
+        dropIfLate,
+        signal,
         ...(def.validateObject
           ? { validate: (object: any) => def.validateObject!(object, built.extras) }
           : {}),

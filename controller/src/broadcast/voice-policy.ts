@@ -30,6 +30,25 @@
 
 import * as settings from '../settings.js';
 
+// A scheduled long-form episode is a real timeline programme, not another
+// ducked voice clip. While it owns the microphone, autonomous links, idents,
+// skills and banter must not be generated or queued: they would otherwise
+// remain eligible to play over the narration (or turn into stale speech after
+// it). The runtime sets/clears this process-local lease at show boundaries.
+let exclusiveTimelineOwner: string | null = null;
+
+export function setExclusiveTimelineVoiceOwner(owner: string | null): void {
+  exclusiveTimelineOwner = owner && owner.trim() ? owner.trim() : null;
+}
+
+export function exclusiveTimelineVoiceOwner(): string | null {
+  return exclusiveTimelineOwner;
+}
+
+export function timelineVoiceBlocked(): boolean {
+  return exclusiveTimelineOwner !== null;
+}
+
 // The raw switch. Absent/non-boolean (any settings.json written before the key
 // existed) reads as ON, so an upgrade changes nothing.
 export function voiceEnabled(): boolean {
@@ -39,10 +58,14 @@ export function voiceEnabled(): boolean {
 // May an AUTONOMOUS talk moment start? The question every cron tick, boundary
 // hook and pick cycle asks. Manual runners must NOT call this.
 export function autoVoiceAllowed(): boolean {
-  return voiceEnabled();
+  return voiceEnabled() && !timelineVoiceBlocked();
 }
 
 // Snapshot for the admin /debug surface, alongside budgetStatus().
 export function voiceStatus() {
-  return { enabled: voiceEnabled() };
+  return {
+    enabled: voiceEnabled(),
+    timelineOwner: exclusiveTimelineOwner,
+    autonomousAllowed: autoVoiceAllowed(),
+  };
 }

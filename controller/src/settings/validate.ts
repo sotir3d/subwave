@@ -31,6 +31,12 @@ import {
   SHOW_ENERGY,
   SHOW_FILTER_VALUES_MAX,
   SHOW_MOODS,
+  SPOKEN_FORMATS,
+  SPOKEN_MUSIC_BREAKS_MAX,
+  SPOKEN_PROMPT_MAX,
+  SPOKEN_TARGET_MINUTES_MAX,
+  SPOKEN_TARGET_MINUTES_MIN,
+  SpokenFormat,
   SKILLS_PER_PERSONA_LIMIT,
   SKILL_SLUG_RE,
   SOUL_MAX,
@@ -50,6 +56,7 @@ import {
   coerceShowGenres,
   coerceShowMoods,
   emptyWeek,
+  minimumSpokenTargetMinutes,
   mintId,
   normalizeDial,
   normalizeMoodName,
@@ -465,10 +472,51 @@ export function validateShowsStrict(raw, personas, allowedThemeIds: Set<string>,
     const programme = item.programme === true;
     const segmentSkill = String(item.segmentSkill ?? '').trim();
     if (segmentSkill.length > 64) throw new Error(`shows[${i}].segmentSkill must be 0-64 chars`);
+    const spokenRaw = item.spoken ?? {};
+    if (!spokenRaw || typeof spokenRaw !== 'object' || Array.isArray(spokenRaw)) {
+      throw new Error(`shows[${i}].spoken must be an object`);
+    }
+    const spokenFormat = String(spokenRaw.format ?? 'custom') as SpokenFormat;
+    if (!SPOKEN_FORMATS.includes(spokenFormat)) {
+      throw new Error(`shows[${i}].spoken.format must be one of: ${SPOKEN_FORMATS.join(', ')}`);
+    }
+    const spokenPrompt = String(spokenRaw.prompt ?? '').trim();
+    if (spokenPrompt.length > SPOKEN_PROMPT_MAX) {
+      throw new Error(`shows[${i}].spoken.prompt must be 0-${SPOKEN_PROMPT_MAX} chars`);
+    }
+    const spokenTarget = Number(spokenRaw.targetMinutes ?? 30);
+    if (!Number.isInteger(spokenTarget)
+      || spokenTarget < SPOKEN_TARGET_MINUTES_MIN
+      || spokenTarget > SPOKEN_TARGET_MINUTES_MAX) {
+      throw new Error(
+        `shows[${i}].spoken.targetMinutes must be an integer from ${SPOKEN_TARGET_MINUTES_MIN}-${SPOKEN_TARGET_MINUTES_MAX}`,
+      );
+    }
+    const spokenBreaks = Number(spokenRaw.musicBreaks ?? 1);
+    if (!Number.isInteger(spokenBreaks) || spokenBreaks < 0 || spokenBreaks > SPOKEN_MUSIC_BREAKS_MAX) {
+      throw new Error(`shows[${i}].spoken.musicBreaks must be an integer from 0-${SPOKEN_MUSIC_BREAKS_MAX}`);
+    }
+    const minimumTarget = minimumSpokenTargetMinutes(spokenBreaks);
+    if (spokenTarget < minimumTarget) {
+      throw new Error(
+        `shows[${i}].spoken.targetMinutes must be at least ${minimumTarget} with ${spokenBreaks} planned song break${spokenBreaks === 1 ? '' : 's'}`,
+      );
+    }
+    const spoken = {
+      enabled: spokenRaw.enabled === true,
+      format: spokenFormat,
+      prompt: spokenPrompt,
+      targetMinutes: spokenTarget,
+      useWeb: spokenRaw.useWeb === true || spokenFormat === 'current-events',
+      musicBreaks: spokenBreaks,
+    };
+    if (spoken.enabled && programme) {
+      throw new Error(`shows[${i}] cannot enable programme and spoken long-form modes together`);
+    }
     let id = typeof item.id === 'string' && ID_RE.test(item.id) ? item.id : mintId('s_');
     if (seen.has(id)) id = mintId('s_');
     seen.add(id);
-    return { id, name, topic, personaId: item.personaId, guestPersonaIds, banter, programme, segmentSkill, moods, themeId, genres, eras, energies, filtersStrict, maxTrackSeconds, playlistIds, playlistStrict, excludedPlaylistIds };
+    return { id, name, topic, personaId: item.personaId, guestPersonaIds, banter, programme, segmentSkill, spoken, moods, themeId, genres, eras, energies, filtersStrict, maxTrackSeconds, playlistIds, playlistStrict, excludedPlaylistIds };
   });
 }
 

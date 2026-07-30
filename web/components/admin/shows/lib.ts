@@ -42,8 +42,16 @@ export function hydrateShow(s: Partial<Show>): Show {
     playlistIds: Array.isArray(s.playlistIds) ? s.playlistIds : [],
     playlistStrict: s.playlistStrict ?? false,
     excludedPlaylistIds: Array.isArray(s.excludedPlaylistIds) ? s.excludedPlaylistIds : [],
-    programme: s.programme ?? false,
+    programme: s.spoken?.enabled ? false : (s.programme ?? false),
     segmentSkill: s.segmentSkill ?? '',
+    spoken: {
+      enabled: s.spoken?.enabled ?? false,
+      format: s.spoken?.format ?? 'custom',
+      prompt: s.spoken?.prompt ?? '',
+      targetMinutes: s.spoken?.targetMinutes ?? 30,
+      useWeb: s.spoken?.useWeb ?? false,
+      musicBreaks: s.spoken?.musicBreaks ?? 1,
+    },
   };
 }
 
@@ -97,9 +105,15 @@ export function showPayload(s: Show) {
     // Strict only means something with at least one playlist pinned.
     playlistStrict: (s.playlistIds?.length ?? 0) > 0 && s.playlistStrict,
     excludedPlaylistIds: s.excludedPlaylistIds || [],
-    programme: s.programme ?? false,
+    programme: s.spoken?.enabled ? false : (s.programme ?? false),
     // A skill pin only means something in programme mode.
-    segmentSkill: s.programme ? (s.segmentSkill || '') : '',
+    segmentSkill: s.programme && !s.spoken.enabled ? (s.segmentSkill || '') : '',
+    spoken: {
+      ...s.spoken,
+      enabled: !!s.spoken?.enabled,
+      prompt: s.spoken?.prompt?.trim() || '',
+      useWeb: s.spoken?.format === 'current-events' || !!s.spoken?.useWeb,
+    },
   };
 }
 
@@ -156,6 +170,7 @@ export function showRow(s: Show, index: number, personas: Persona[], apiBase: st
     name: s.name.trim(),
     colour: SHOW_COLORS[index % SHOW_COLORS.length] ?? '#000',
     programme: !!s.programme,
+    spokenMinutes: s.spoken?.enabled ? s.spoken.targetMinutes : null,
     skillPin: s.programme && s.segmentSkill ? s.segmentSkill : '',
     banter: !!s.banter,
     host: host ? faceOf(host, apiBase) : null,

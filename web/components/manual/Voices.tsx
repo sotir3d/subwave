@@ -172,6 +172,19 @@ docker compose up -d`}</CodeBlock>
             path on a shared volume.
           </p>
         </div>
+        <p className="text-muted">
+          Network addresses are resolved from the controller&apos;s point of view. With
+          Docker Desktop and a voice server on the same Windows machine,{' '}
+          <code className="bs-code-inline">host.docker.internal</code> is usually the
+          right hostname. With SUB/WAVE on a separate Ubuntu server, bind the Windows
+          voice server to its LAN interface and use the Windows PC&apos;s LAN or Tailscale
+          address; <code className="bs-code-inline">localhost</code> and{' '}
+          <code className="bs-code-inline">host.docker.internal</code> refer to the Ubuntu
+          host in that layout. Allow the port through Windows Firewall only for the
+          Ubuntu server or trusted LAN, then verify{' '}
+          <code className="bs-code-inline">GET /health</code> from inside the controller
+          container.
+        </p>
         <p>That&apos;s the whole server — for example, in Flask:</p>
         <CodeBlock>{`@app.get("/health")
 def health():
@@ -185,12 +198,38 @@ def speak():
     wav   = my_model.render(text, voice)        # -> WAV bytes
     return Response(wav, mimetype="audio/wav")`}</CodeBlock>
         <p className="text-muted">
-          Optional: if your server substitutes a different voice than the one requested,
+          If your server substitutes a different voice than the one requested,
           set the <code className="bs-code-inline">X-TTS-Fell-Back</code> response header
-          (plus <code className="bs-code-inline">X-TTS-Voice-Used</code> and{' '}
+          and report the exact voice with <code className="bs-code-inline">X-TTS-Voice-Used</code>
+          (plus{' '}
           <code className="bs-code-inline">X-TTS-Fell-Back-Reason</code>) and SUB/WAVE logs
           the substitution instead of leaving you to guess why the voice changed.
         </p>
+        <div className="bs-callout">
+          <div className="bs-eyebrow">LONG-FORM VOICES</div>
+          <p>
+            Spoken programmes use this same Remote contract. SUB/WAVE splits a chapter
+            into sequential provider-sized calls and joins compatible uncompressed PCM
+            WAV responses locally, so a voice server never has to render the whole
+            half-hour in one request. A richer health response can advertise the safe
+            acoustic window, for example{' '}
+            <code className="bs-code-inline">{`{ "ok": true, "ready": true, "engine": "echotts", "maxSeconds": 30 }`}</code>.
+            Engines built for a longer context can report a larger{' '}
+            <code className="bs-code-inline">maxSeconds</code>; absent that field, SUB/WAVE
+            uses conservative roughly-25-second chunks. EchoTTS and FireRedTTS2 can both
+            sit behind this wrapper without becoming controller-specific integrations.
+          </p>
+          <p>
+            Each chunk response must be an uncompressed PCM WAV (WAVE format 1), and
+            every chunk in a chapter must use the same channel count, sample rate and bit
+            depth so it can be joined without transcoding. Long-form rendering is
+            strict about voice consistency: return the exact requested id in{' '}
+            <code className="bs-code-inline">X-TTS-Voice-Used</code>; if the server substitutes,
+            also return <code className="bs-code-inline">X-TTS-Fell-Back: true</code>. A
+            reported mismatch fails the chapter and retries it instead of quietly changing
+            narrator mid-programme.
+          </p>
+        </div>
       </section>
 
       <section className="bs-section">

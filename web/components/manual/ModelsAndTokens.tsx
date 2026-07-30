@@ -55,6 +55,14 @@ export default function ModelsAndTokens() {
           that fails through one route can be flawless through another. When you evaluate a
           model, evaluate it through the provider you&rsquo;ll actually run.
         </p>
+        <p className="text-muted">
+          SUB/WAVE admits one model operation at a time across the controller and its
+          library-tagger child process. Listener requests and playout work go first;
+          long-form chapters wait their turn while music keeps running. If the same
+          llama.cpp server is also used by programs outside SUB/WAVE, configure the
+          server itself for one generation slot (<code className="bs-code-inline">--parallel 1</code>)
+          as the final concurrency backstop.
+        </p>
       </section>
 
       <section className="bs-section">

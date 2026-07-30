@@ -62,11 +62,15 @@ for (const f of [
   'bed-playing.json', 'listeners.jsonl', 'audience.json', 'likes.json',
   'seen-curiosity.json', 'next.txt', 'say.txt', 'intro.txt', 'sfx.txt',
   'auto.m3u', 'library.db-wal', 'library.db-shm', 'station.json',
+  'llm-admission.lock', 'llm-admission.reaper.lock',
   'settings.json.bak-pre-ollama', 'some-future-file.xyz',
 ]) assert.equal(duplicateAction(f), 'skip', f);
 
 // --- conversion classification (spec §6) --------------------------------------
-for (const f of ['stations', 'icecast-secrets.env', 'hf-cache', 'analyze-tmp', 'lost+found'])
+for (const f of [
+  'stations', 'icecast-secrets.env', 'hf-cache', 'analyze-tmp', 'lost+found',
+  'llm-admission.lock', 'llm-admission.reaper.lock',
+])
   assert.equal(conversionAction(f), 'keep', f);
 for (const f of ['settings.json', 'library.db', 'jingles', 'logs', 'archive', 'session.json'])
   assert.equal(conversionAction(f), 'move', f);

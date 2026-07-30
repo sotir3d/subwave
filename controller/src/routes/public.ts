@@ -203,10 +203,11 @@ router.get('/now-playing', async (req, res) => {
     // in the library DB keyed by subsonic_id; getNowPlaying() stays a pure
     // reader of now-playing.json. A not-yet-tagged track (or unloaded DB)
     // yields null here and the fields are simply omitted.
+    const isTimelineTalk = nowPlaying?.subwave_kind === 'talk';
     if (nowPlaying?.subsonic_id) {
       // Lean read: only the scalar fields the metadata strip renders, so this
       // per-listener 5s poll never parses the heavy acoustic *_json blobs (#723).
-      const rec = library.getPlaybackMeta(nowPlaying.subsonic_id);
+      const rec = isTimelineTalk ? null : library.getPlaybackMeta(nowPlaying.subsonic_id);
       if (rec) {
         // Full tag set for consumers that want it, plus the comma-joined
         // string in the legacy `genre` field the metadata strip renders —
@@ -233,6 +234,10 @@ router.get('/now-playing', async (req, res) => {
         if (typeof duration === 'number' && duration > 0) nowPlaying.duration = duration;
       }
     }
+    // `talk:<episode>:<chapter>` is an internal queue-correlation key, not a
+    // Navidrome song id. Keep kind/talk_id visible, but do not make skins fetch
+    // bogus cover art or expose a like button for narration.
+    if (isTimelineTalk && nowPlaying) delete nowPlaying.subsonic_id;
     // Served from the 15s listener-monitor cache — no per-request Icecast hit.
     const stream = getStreamStatus();
     const stationSettings = settings.get();

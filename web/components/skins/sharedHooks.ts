@@ -171,7 +171,9 @@ export interface TrackLike {
 export function useTrackLike(): TrackLike {
   const { likeCurrent, likeStatus } = usePlayerActions();
   const feed = usePlayerFeed();
-  const songId = feed.nowPlaying?.subsonic_id || null;
+  const songId = feed.nowPlaying?.subwave_kind === 'talk'
+    ? null
+    : feed.nowPlaying?.subsonic_id || null;
 
   // enabled starts false ("unknown") so stations with likes off never flash a
   // heart; the first status fetch flips it on.

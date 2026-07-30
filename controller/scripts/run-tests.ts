@@ -17,6 +17,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
+// Resolve the package's real JS entry and invoke it through this Node binary.
+// Spawning the bare `tsx` shim works on POSIX but Windows' spawnSync does not
+// resolve npm's `.cmd` wrapper without a shell, making every test look failed.
+const tsxCli = fileURLToPath(import.meta.resolve('tsx/cli'));
 const filter = process.argv[2]; // optional substring filter
 
 const files = readdirSync(scriptsDir)
@@ -35,7 +39,7 @@ console.log(`Running ${files.length} test file(s)${filter ? ` matching "${filter
 const failed: string[] = [];
 for (const file of files) {
   console.log(`\x1b[1m▶ ${file}\x1b[0m`);
-  const { status } = spawnSync('tsx', [join(scriptsDir, file)], { stdio: 'inherit' });
+  const { status } = spawnSync(process.execPath, [tsxCli, join(scriptsDir, file)], { stdio: 'inherit' });
   if (status !== 0) failed.push(file);
   console.log('');
 }

@@ -42,6 +42,7 @@ import {
 import type { Persona, Show, SkillOption, ThemeOption } from './types';
 import { hasAnyMusicFilter, showValid } from './lib';
 import { ChipRow } from './ChipRow';
+import { SpokenProgrammeEditor } from './SpokenProgrammeEditor';
 
 // ── inline show editor ─────────────────────────────────────────────────────
 // The former modal body, lifted to an in-page editor (the personas pattern).
@@ -225,7 +226,15 @@ export function ShowEditor({
               <div className="pt-0.5">
                 <Toggle
                   on={show.programme}
-                  onClick={() => update({ programme: !show.programme })}
+                  onClick={() => update({
+                    programme: !show.programme,
+                    // The two directors share the same talk boundaries. Turning
+                    // this legacy arc on makes the choice explicit and disables
+                    // long-form rather than running both over one another.
+                    spoken: !show.programme && show.spoken.enabled
+                      ? { ...show.spoken, enabled: false }
+                      : show.spoken,
+                  })}
                   ariaLabel="Programme (produced episode)"
                 />
               </div>
@@ -265,6 +274,8 @@ export function ShowEditor({
               </div>
             )}
           </Field>
+
+          <SpokenProgrammeEditor show={show} update={update} />
 
           <Field>
             <Label>theme override (applied while this show is on air)</Label>

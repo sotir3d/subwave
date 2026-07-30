@@ -6,4 +6,12 @@
 export { djText } from './internal/strategy/text.js';
 export { djObject } from './internal/strategy/object.js';
 export { djAgent } from './internal/strategy/agent.js';
+export {
+  getLlmAdmissionStatus,
+  LLM_ADMISSION_PRIORITY,
+  LlmAdmissionDroppedError,
+  defaultLlmAdmissionPriority,
+  withLlmAdmission,
+} from './internal/core/admission.js';
+export type { LlmAdmissionMetadata, LlmAdmissionStatus } from './internal/core/admission.js';
 export { isUnreachable, isQuotaOrAuthError, errReason, nearestId, stripThinking, modelTolerant } from './internal/core/pure.js';

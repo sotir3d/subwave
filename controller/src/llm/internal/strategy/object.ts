@@ -13,6 +13,7 @@
 // Throws only if BOTH attempts fail.
 
 import { generateText, Output } from 'ai';
+import { withLlmAdmission } from '../core/admission.js';
 import { withFailover } from '../core/failover.js';
 import { withTransientRetry } from '../core/retry.js';
 import { stripThinking, extractJson, usageOf, perfOf, warningsOf, failureDiagnostics, schemaHint } from '../core/pure.js';
@@ -32,17 +33,20 @@ export async function djObject({
   maxOutputTokens = resolveMaxOutputTokens(MAX_TOKENS_OBJECT),
   kind = 'sdk.djObject',
   leg = undefined,
-  // Optional caller-supplied abort signal. No live caller wraps djObject in
-  // withDeadline today, so this is inert unless one starts to — kept in the
-  // shape as a precaution so a future deadline-wrapped call can cut the
-  // Retry-After sleep short and prevent a ghost retry after the abort (mirrors
-  // djAgent's threading, PR #751 review).
+  priority = undefined,
+  neededBy = undefined,
+  dropIfLate = false,
+  // Optional caller-supplied abort signal. Admission removes an aborted queued
+  // call; once active it also reaches the transport and cuts transient-retry
+  // backoff short.
   signal = undefined,
 }: any): Promise<any> {
-  return withFailover(
-    kind,
-    (err) => ({ user: prompt, ...failureDiagnostics(err) }),
-    async (l) => {
+  return withLlmAdmission(
+    { kind, priority, neededBy, dropIfLate, signal },
+    () => withFailover(
+      kind,
+      (err) => ({ user: prompt, ...failureDiagnostics(err) }),
+      async (l) => {
       let lastErr;
       // Track the strategy actually attempted so a failure record attributes to
       // the right sub-path — bucketing every failure as 'ai-sdk' hides which
@@ -135,7 +139,9 @@ export async function djObject({
       // a model/parse failure (→ surface it).
       (lastErr as any).__via = lastVia;
       throw lastErr;
-    },
-    leg,
+      },
+      leg,
+      signal,
+    ),
   );
 }

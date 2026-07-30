@@ -33,6 +33,7 @@ export interface ShowRow {
   name: string;
   colour: string;
   programme: boolean;
+  spokenMinutes: number | null;
   // The pinned feature segment, shown next to the Programme pill.
   skillPin: string;
   banter: boolean;
@@ -90,6 +91,7 @@ export function ShowsTable({ rows, onEdit }: ShowsTableProps) {
           {r.programme && (
             <Pill tone="solid" dot>Programme{r.skillPin ? ` · ${r.skillPin}` : ''}</Pill>
           )}
+          {r.spokenMinutes != null && <Pill tone="accent">Spoken · {r.spokenMinutes}m</Pill>}
           {r.banter && r.guests.length > 0 && <Pill>Banter</Pill>}
         </span>
       ),

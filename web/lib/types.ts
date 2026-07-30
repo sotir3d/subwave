@@ -15,6 +15,8 @@ export interface NowPlayingTrack {
   year?: number;
   duration?: number;
   subsonic_id?: string;
+  subwave_kind?: 'talk' | string;
+  talk_id?: string;
   // Analysis/tag data merged in by the controller's /now-playing handler from
   // the library DB. All optional — a not-yet-tagged track omits them and the
   // player's metadata strip renders nothing.

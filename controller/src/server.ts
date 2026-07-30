@@ -21,6 +21,7 @@ import { startScheduler } from './broadcast/scheduler.js';
 import { startListenerMonitor } from './broadcast/listeners.js';
 import { startStreamIdleMonitor } from './broadcast/stream-idle.js';
 import { startAudienceMonitor } from './broadcast/audience.js';
+import { startLongformRuntime, stopLongformRuntime } from './broadcast/longform/runtime.js';
 import * as likes from './broadcast/likes.js';
 import { cors } from './middleware/cors.js';
 import { assertAdminConfigured } from './middleware/auth.js';
@@ -38,6 +39,7 @@ import { router as playlistsRoutes } from './routes/playlists.js';
 import { router as onboardingRoutes } from './routes/onboarding.js';
 import { router as archivesRoutes } from './routes/archives.js';
 import { router as listenersRoutes } from './routes/listeners.js';
+import { router as longformRoutes } from './routes/longform.js';
 import { router as webhooksRoutes } from './routes/webhooks.js';
 import { router as scrobbleRoutes } from './routes/scrobble.js';
 import { router as likesRoutes } from './routes/likes.js';
@@ -88,6 +90,7 @@ function shutdown(signal: string): void {
       console.error('[shutdown] TTS worker stop failed:', err instanceof Error ? err.message : err);
     }
   }
+  stopLongformRuntime();
   try {
     library.shutdown();
   } catch (err: any) {
@@ -120,6 +123,7 @@ app.use(playlistsRoutes);
 app.use(onboardingRoutes);
 app.use(archivesRoutes);
 app.use(listenersRoutes);
+app.use(longformRoutes);
 app.use(webhooksRoutes);
 app.use(scrobbleRoutes);
 app.use(likesRoutes);
@@ -282,6 +286,11 @@ app.listen(config.server.port, async () => {
 
   queue.startWatcher();
   startListenerMonitor();
+  try {
+    await startLongformRuntime();
+  } catch (err: any) {
+    console.error('[longform] runtime start failed:', err.message);
+  }
   startStreamIdleMonitor();
   startAudienceMonitor().catch(err => console.error('[audience] init failed:', err.message));
   // Load likes up front so the sync readers (pickSystem's favourites lean, the
