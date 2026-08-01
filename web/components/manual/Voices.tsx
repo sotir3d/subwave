@@ -220,11 +220,13 @@ def speak():
             sit behind this wrapper without becoming controller-specific integrations.
           </p>
           <p>
-            This repository includes a Windows-native EchoTTS bridge under{' '}
-            <code className="bs-code-inline">tools/echo-tts</code>. Its setup and run
-            scripts keep Echo resident on a selected CUDA device, serialize synthesis,
-            load narrator references from a controlled voice directory, and return strict
-            PCM WAV responses for a controller running on another machine.
+            This repository includes a self-contained Windows AI runtime under{' '}
+            <code className="bs-code-inline">tools/echo-tts</code>. Run its one-time{' '}
+            <code className="bs-code-inline">setup-windows.bat</code>, then{' '}
+            <code className="bs-code-inline">start-windows-ai.bat</code> starts and
+            supervises both llama.cpp and EchoTTS. Echo stays resident on its selected
+            CUDA device, serializes synthesis, and returns strict PCM WAV responses for a
+            controller running on another machine.
           </p>
           <p>
             Each chunk response must be an uncompressed PCM WAV (WAVE format 1), and

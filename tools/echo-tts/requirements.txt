@@ -1,0 +1,9 @@
+# Minimal runtime set used by the pinned Echo-TTS inference checkout.
+# Gradio is intentionally omitted: SUB/WAVE talks to server.py directly.
+# The CUDA PyTorch stack is installed separately by bootstrap.py from
+# PyTorch's CUDA 12.8 wheel index. Keeping it out of this file prevents a
+# later generic PyPI install from replacing it with a CPU-only wheel.
+huggingface-hub>=0.34,<2
+numpy>=2,<3
+safetensors>=0.5,<1
+einops>=0.8,<1

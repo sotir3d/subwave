@@ -26,6 +26,15 @@ BRIDGE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = BRIDGE
 SPEC.loader.exec_module(BRIDGE)
 
+SUPERVISOR_SPEC = importlib.util.spec_from_file_location(
+    "subwave_windows_ai_supervisor",
+    Path(__file__).with_name("supervisor.py"),
+)
+assert SUPERVISOR_SPEC and SUPERVISOR_SPEC.loader
+SUPERVISOR = importlib.util.module_from_spec(SUPERVISOR_SPEC)
+sys.modules[SUPERVISOR_SPEC.name] = SUPERVISOR
+SUPERVISOR_SPEC.loader.exec_module(SUPERVISOR)
+
 
 def fixture_wav() -> bytes:
     output = io.BytesIO()
@@ -95,11 +104,50 @@ class VoiceCatalogTests(unittest.TestCase):
                 catalog.resolve("voice")
 
 
+class SupervisorSelectionTests(unittest.TestCase):
+    def test_auto_selects_a_sole_gguf(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = root / "radio.gguf"
+            model.write_bytes(b"GGUF")
+            selected = SUPERVISOR._pick_model({"model": "", "modelDirectory": str(root)})
+            self.assertEqual(selected, model.resolve())
+
+    def test_requires_explicit_model_when_directory_has_multiple_ggufs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "one.gguf").write_bytes(b"GGUF")
+            (root / "two.gguf").write_bytes(b"GGUF")
+            with self.assertRaises(SUPERVISOR.ConfigurationError):
+                SUPERVISOR._pick_model({"model": "", "modelDirectory": str(root)})
+
+    def test_auto_selects_a_sole_voice(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            voice = root / "narrator.wav"
+            voice.write_bytes(fixture_wav())
+            selected_dir, selected_id = SUPERVISOR._pick_voice(
+                {"voiceDirectory": str(root), "defaultVoice": ""},
+            )
+            self.assertEqual(selected_dir, root.resolve())
+            self.assertEqual(selected_id, voice.name)
+
+    def test_selects_a_shared_ffmpeg_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "ffmpeg.exe").write_bytes(b"fixture")
+            for name in ("avcodec-62.dll", "avformat-62.dll", "avutil-60.dll", "swresample-6.dll"):
+                (root / name).write_bytes(b"fixture")
+            selected = SUPERVISOR._pick_ffmpeg({"ffmpegDirectory": str(root)})
+            self.assertEqual(selected, root.resolve())
+
+
 class HttpContractTests(unittest.TestCase):
     def test_health_and_pcm_speak_contract(self):
         with RunningServer() as running:
             with urllib.request.urlopen(f"{running.base}/health", timeout=2) as response:
                 health = json.load(response)
+                self.assertEqual(response.headers["Connection"], "close")
             self.assertTrue(health["ok"])
             self.assertTrue(health["ready"])
             self.assertEqual(health["engine"], "echotts")
@@ -115,6 +163,7 @@ class HttpContractTests(unittest.TestCase):
                 self.assertEqual(response.headers["Content-Type"], "audio/wav")
                 self.assertEqual(response.headers["X-TTS-Voice-Used"], "narrator.wav")
                 self.assertEqual(response.headers["X-TTS-Fell-Back"], "false")
+                self.assertEqual(response.headers["Connection"], "close")
             self.assertEqual(audio[:4], b"RIFF")
             self.assertEqual(audio[8:12], b"WAVE")
             with wave.open(io.BytesIO(audio), "rb") as wav:

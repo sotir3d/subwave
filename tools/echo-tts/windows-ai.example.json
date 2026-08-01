@@ -1,0 +1,26 @@
+{
+  "llama": {
+    "enabled": true,
+    "executable": ".runtime/llama.cpp/llama-server.exe",
+    "model": "",
+    "modelDirectory": "models",
+    "alias": "subwave-local",
+    "listenAddress": "0.0.0.0",
+    "port": 8080,
+    "gpuDevice": "0,1",
+    "gpuLayers": 99,
+    "contextSize": 32768,
+    "parallel": 1,
+    "extraArgs": ["--tensor-split", "3,1"]
+  },
+  "echo": {
+    "enabled": true,
+    "listenAddress": "0.0.0.0",
+    "port": 5001,
+    "gpuDevice": "1",
+    "ffmpegDirectory": "",
+    "voiceDirectory": "voices",
+    "defaultVoice": "narrator.wav",
+    "sequenceLength": 640
+  }
+}

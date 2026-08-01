@@ -478,10 +478,12 @@ class EchoRequestHandler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, body: dict[str, Any]) -> None:
         payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -537,10 +539,12 @@ class EchoRequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Echo-TTS synthesis failed: {error}")
             return
 
+        self.close_connection = True
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(result.wav)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.send_header("X-TTS-Engine", ENGINE_ID)
         self.send_header("X-TTS-Voice-Used", result.voice_id)
         self.send_header("X-TTS-Fell-Back", "false")

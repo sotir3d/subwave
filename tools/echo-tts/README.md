@@ -1,151 +1,145 @@
-# Echo-TTS bridge for SUB/WAVE
+# Windows AI runtime for SUB/WAVE
 
-This bridge runs [Echo-TTS](https://github.com/jordandare/echo-tts) as a
-Windows-native, GPU-resident HTTP service for SUB/WAVE's **Remote** TTS engine.
-SUB/WAVE can run in Docker on another Ubuntu machine; WAV audio travels over
-HTTP, so the two hosts do not share a filesystem.
+This directory provides the Windows half of a split SUB/WAVE installation:
 
-The service implements:
+- SUB/WAVE, Icecast, Liquidsoap, and the web UI run on Ubuntu.
+- `llama-server` and Echo-TTS run on the Windows machine with two RTX 3090s.
+- One batch file starts and supervises both Windows services.
 
-- `GET /health` — model readiness, installed voices, and Echo's acoustic window.
-- `POST /speak` — accepts `{ "text": "...", "voice": "narrator.wav" }` and
-  returns a format-1, 16-bit PCM WAV in the response body.
-- `X-TTS-Voice-Used` — always reports the exact requested voice ID. A missing
-  voice fails explicitly; it never silently changes narrator.
-- One serialized inference lane — concurrent callers cannot compete for the
-  same GPU or interleave model work.
+## One-time setup
 
-## Requirements
+Python 3.11, Git, a current NVIDIA driver, and a shared FFmpeg build are
+required. Your existing `C:\ffmpeg\bin` is detected automatically. From this
+directory, run:
 
-- Windows 10/11 and a CUDA-capable NVIDIA GPU. Echo upstream states an 8 GB
-  minimum; an RTX 3090 has ample room for the full 640-latent (~30 second)
-  generation window.
-- Current NVIDIA driver.
-- Git.
-- Python 3.11. Keep Echo in its own environment; do not use Subwave's or another
-  model server's Python environment.
-- A clean 5–15 second reference recording for each narrator. WAV is preferred.
-  Use only voices you are permitted to reproduce.
-
-Echo's model weights and generated outputs are CC-BY-NC-SA-4.0 because of the
-Fish Speech S1-DAC dependency. Review the upstream license before using output
-outside a private, non-commercial station.
-
-## Install on Windows
-
-From this directory in the Windows checkout of your Subwave fork:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```bat
+setup-windows.bat
 ```
 
-The script creates `%LOCALAPPDATA%\Subwave\EchoTTS`, clones the official Echo
-repository, creates a Python 3.11 virtual environment, and installs upstream's
-requirements. It deliberately does not auto-update an existing Echo checkout.
+The bootstrap performs the complete software setup:
 
-Copy a narrator reference into:
+- Creates the real, repo-local `.venv` using Python 3.11.
+- Installs CUDA 12.8 PyTorch and only Echo's inference dependencies; Gradio is
+  not installed.
+- Detects a shared FFmpeg runtime for TorchCodec and records its `bin` path.
+- Checks out Echo-TTS at pinned revision
+  `2ed95fce62d33bf7b56f835fd9ec0f0b6fb9155e`.
+- Downloads Echo and Fish S1-DAC weights into `.runtime/hf-cache`.
+- Installs the official CUDA 12.4 llama.cpp `b10189` Windows runtime.
+- Creates the ignored machine-local `windows-ai.json` configuration.
+
+`.venv`, downloaded runtimes, model caches, GGUF files, reference voices, logs,
+and local configuration are gitignored.
+
+If the GGUF and narrator recording already exist, configure them during setup:
+
+```bat
+setup-windows.bat --model "D:\Models\gemma.gguf" --voice "D:\Audio\narrator.wav"
+```
+
+If FFmpeg lives somewhere other than `C:\ffmpeg`, add
+`--ffmpeg-dir "D:\path\to\ffmpeg"`.
+
+Otherwise, after setup:
+
+1. Put exactly one `.gguf` file in `models\`.
+2. Put `narrator.wav` in `voices\`.
+
+The launcher automatically selects a sole model or voice. If either directory
+contains multiple choices, set the explicit paths/IDs in `windows-ai.json`.
+
+## Start everything
+
+Double-click:
 
 ```text
-%LOCALAPPDATA%\Subwave\EchoTTS\voices\narrator.wav
+start-windows-ai.bat
 ```
 
-## Run on the second 3090
+That is the normal day-to-day operation. The supervisor:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run.ps1 `
-  -CudaDevice 1 `
-  -DefaultVoice narrator.wav
+- Runs llama.cpp across both GPUs at `0.0.0.0:8080` with one request slot. The
+  default `3,1` tensor split keeps most of the Q8 model on GPU 0.
+- Runs Echo-TTS on physical GPU 1 at `0.0.0.0:5001`; it can coexist with the
+  smaller llama.cpp allocation on that card.
+- Prefixes both services' output in one console and writes a combined log under
+  `.runtime\logs`.
+- Waits for both health endpoints and prints when the Windows AI side is ready.
+- Stops both children together when you press Ctrl+C or if either process dies.
+
+Validate configuration without launching models:
+
+```bat
+start-windows-ai.bat --check
 ```
 
-`CUDA_VISIBLE_DEVICES=1` is set for the child process, so Echo sees the second
-physical 3090 as its logical `cuda:0`. Keep llama.cpp on physical GPU 0.
+## Connect the Ubuntu server
 
-The first launch downloads the Echo and Fish S1-DAC weights into the persistent
-`%LOCALAPPDATA%\Subwave\EchoTTS\hf-cache` directory. The HTTP port binds
-immediately and `/health` reports `ready: false` until model loading completes.
-It also remains unready until at least one reference voice exists.
+Allow TCP ports 8080 and 5001 through Windows Firewall only from the Ubuntu
+server's LAN or Tailscale address. Do not expose either port publicly.
 
-Check readiness:
+In SUB/WAVE configure:
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:5001/health
+```text
+LLM provider: OpenAI-compatible
+LLM base URL: http://WINDOWS_IP:8080/v1
+LLM model: subwave-local
+
+TTS engine: Remote
+TTS server URL: http://WINDOWS_IP:5001
+Persona Remote voice: narrator.wav
 ```
 
-Render a direct test:
-
-```powershell
-Invoke-WebRequest `
-  -Uri http://127.0.0.1:5001/speak `
-  -Method Post `
-  -ContentType application/json `
-  -Body '{"text":"This is an Echo TTS test.","voice":"narrator.wav"}' `
-  -OutFile echo-test.wav
-```
-
-## Allow only the Ubuntu server through Windows Firewall
-
-Run an elevated PowerShell once, replacing the address with the Ubuntu server's
-LAN or Tailscale IP:
-
-```powershell
-New-NetFirewallRule `
-  -DisplayName 'SUBWAVE Echo-TTS from Ubuntu' `
-  -Direction Inbound `
-  -Action Allow `
-  -Protocol TCP `
-  -LocalPort 5001 `
-  -RemoteAddress 192.168.1.50
-```
-
-The bridge has no application-level authentication. Do not expose port 5001 to
-the public internet; restrict it with Windows Firewall, a trusted LAN, or
-Tailscale.
-
-## Connect the Ubuntu Subwave controller
-
-From Ubuntu, first verify both the host and the controller container can reach
-Windows:
+Verify from inside the Ubuntu controller container:
 
 ```bash
-curl http://WINDOWS_LAN_OR_TAILSCALE_IP:5001/health
-docker compose exec controller \
-  curl -fsS http://WINDOWS_LAN_OR_TAILSCALE_IP:5001/health
+docker compose exec controller curl -fsS http://WINDOWS_IP:8080/health
+docker compose exec controller curl -fsS http://WINDOWS_IP:5001/health
 ```
 
-In SUB/WAVE:
+Do not use `host.docker.internal` in a two-machine setup. From Ubuntu it refers
+to the Ubuntu Docker host, not the Windows PC.
 
-1. Open **Admin → Settings → TTS voice**.
-2. Choose **Remote** and set the server URL to
-   `http://WINDOWS_LAN_OR_TAILSCALE_IP:5001` — no `/speak` suffix.
-3. Open **Admin → Personas**, choose **Remote** for the on-air persona, and set
-   **Remote voice** to `narrator.wav` exactly.
-4. Play a voice preview before scheduling a spoken programme.
+## Echo behavior
 
-Do not use `host.docker.internal` in this two-machine layout: from the Ubuntu
-container it means the Ubuntu host, not Windows.
+The bridge implements SUB/WAVE's Remote TTS contract:
 
-## Tuning
+- `GET /health` reports readiness, voices, and the ~30-second acoustic window.
+- `POST /speak` accepts `{ "text": "...", "voice": "narrator.wav" }` and
+  returns a format-1, 16-bit PCM WAV.
+- GPU inference is serialized.
+- Missing or ambiguous voices fail explicitly; narrator substitution is never
+  silent.
+- The model binds its HTTP port immediately but remains `ready: false` while
+  loading. SUB/WAVE continues playing music until it becomes ready.
 
-The defaults mirror Echo upstream's high-speaker-CFG sampler and advertise a
-30-second acoustic window. SUB/WAVE leaves headroom and sends roughly 25-second
-chunks. Optional environment variables can be set before invoking `run.ps1`:
+Echo upstream lists 8 GB VRAM as its minimum and recommends short clean
+reference audio. The full model completed a cold-load test on this machine's
+second RTX 3090 while the existing llama.cpp model remained resident. A 5–15
+second WAV is a good narrator reference. Echo's weights
+and generated outputs are CC-BY-NC-SA-4.0 because of the Fish S1-DAC dependency;
+review the [upstream Echo-TTS license](https://github.com/jordandare/echo-tts)
+before using generated output outside a private, non-commercial station.
 
-| Variable | Default | Purpose |
-|---|---:|---|
-| `ECHO_TTS_SEQUENCE_LENGTH` | `640` | Echo acoustic latents; lower this if VRAM is constrained. |
-| `ECHO_TTS_NUM_STEPS` | `40` | Diffusion steps; lower is faster but may reduce quality. |
-| `ECHO_TTS_CFG_SCALE_TEXT` | `3.0` | Text guidance. |
-| `ECHO_TTS_CFG_SCALE_SPEAKER` | `8.0` | Reference-speaker guidance. |
-| `ECHO_TTS_SEED` | `0` | Stable seed for consistent narration. |
-| `ECHO_TTS_MODEL_DTYPE` | `bfloat16` | Resident Echo model dtype. |
-| `ECHO_TTS_FISH_DTYPE` | `float32` | Decoder dtype; the 3090 can use the quality-first default. |
+## Machine-local configuration
 
-## Contract test without downloading the model
+`windows-ai.json` is copied from `windows-ai.example.json` once and then left
+alone by normal setup reruns. Important fields:
 
-```powershell
-python .\test_server.py
+- `llama.model`: an absolute GGUF path, or blank to auto-select from `models\`.
+- `llama.contextSize`: defaults to 32768.
+- `llama.parallel`: fixed to one by default.
+- `llama.gpuDevice`: `0,1` exposes both 3090s to the model.
+- `llama.extraArgs`: defaults to `--tensor-split 3,1` for the 26.8 GB Q8 GGUF.
+- `echo.defaultVoice`: exact filename or unique filename stem.
+- `echo.ffmpegDirectory`: directory containing `ffmpeg.exe` and the shared
+  FFmpeg DLLs. Setup fills this automatically.
+- `echo.sequenceLength`: 640 is Echo's full approximately-30-second window.
+
+## Tests
+
+The bridge/supervisor contract tests do not load torch or download models:
+
+```bat
+.venv\Scripts\python.exe test_server.py
 ```
-
-This exercises health, PCM WAV delivery, exact voice reporting, malformed
-requests, and reference-path safety using a fake inference engine.
-
