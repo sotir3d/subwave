@@ -148,7 +148,7 @@ docker compose up -d`}</CodeBlock>
         <p>
           Configure it under <strong>Admin &rarr; TTS voice</strong>: pick{' '}
           <strong>Remote</strong> and set <strong>Server URL</strong> to the endpoint
-          (e.g. <code className="bs-code-inline">http://192.168.1.101:5001</code>, a LAN or
+          (e.g. <code className="bs-code-inline">http://192.168.1.101:18765</code>, a LAN or
           Tailscale IP the controller container can reach, not{' '}
           <code className="bs-code-inline">127.0.0.1</code>). The console shows{' '}
           <strong>ready</strong> once the health check passes, and the station falls back
@@ -220,13 +220,13 @@ def speak():
             sit behind this wrapper without becoming controller-specific integrations.
           </p>
           <p>
-            This repository includes a self-contained Windows AI runtime under{' '}
+            This repository includes a self-contained Windows EchoTTS runtime under{' '}
             <code className="bs-code-inline">tools/echo-tts</code>. Run its one-time{' '}
             <code className="bs-code-inline">setup-windows.bat</code>, then{' '}
-            <code className="bs-code-inline">start-windows-ai.bat</code> starts and
-            supervises both llama.cpp and EchoTTS. Echo stays resident on its selected
-            CUDA device, serializes synthesis, and returns strict PCM WAV responses for a
-            controller running on another machine.
+            <code className="bs-code-inline">start-echo-tts.bat</code> launches Echo alone
+            on port 18765 and keeps its CMD log window open. It does not manage the LLM
+            server. Echo stays resident on its selected CUDA device, serializes synthesis,
+            and returns strict PCM WAV responses for a controller on another machine.
           </p>
           <p>
             Each chunk response must be an uncompressed PCM WAV (WAVE format 1), and
