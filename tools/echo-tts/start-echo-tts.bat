@@ -25,7 +25,8 @@ if not exist "%FFMPEG_DIR%\ffmpeg.exe" (
 if not exist "%VOICE_DIR%" mkdir "%VOICE_DIR%"
 
 rem Echo only. This script never starts, stops, probes, or configures llama.cpp.
-set "CUDA_VISIBLE_DEVICES=1"
+rem GPU 0 is the default because physical GPU 1 drives the desktop.
+set "CUDA_VISIBLE_DEVICES=0"
 set "ECHO_TTS_DEVICE=cuda"
 set "ECHO_TTS_REPO=%ECHO_REPO%"
 set "ECHO_TTS_VOICE_DIR=%VOICE_DIR%"
@@ -41,7 +42,7 @@ set "PATH=%FFMPEG_DIR%;%PATH%"
 
 echo.
 echo Starting Echo-TTS only
-echo   GPU:        physical CUDA device 1
+echo   GPU:        physical CUDA device 0 ^(GPU 1 left for the display^)
 echo   Listen:     http://0.0.0.0:18765
 echo   Health:     http://127.0.0.1:18765/health
 echo   Voices:     %VOICE_DIR%

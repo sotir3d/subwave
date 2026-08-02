@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 
 DEVICE = os.environ.get("CHATTERBOX_DEVICE", "cpu").lower()
@@ -44,6 +45,12 @@ MAX_CHUNK_CHARS = int(os.environ.get("CHATTERBOX_MAX_CHUNK_CHARS", "280"))
 # breathes instead of butting straight into the next chunk. Kept short — this is
 # a within-segment pause, not a between-segment one.
 CHUNK_GAP_MS = int(os.environ.get("CHATTERBOX_CHUNK_GAP_MS", "160"))
+# Preparing Chatterbox conditionals runs the reference clip through the voice
+# encoder and S3 prompt stack. Repeating that for every <=280-character chunk
+# is pure duplicate work in long-form synthesis. Keep a small LRU of the
+# resulting GPU-side conditionals, keyed by the reference file's identity and
+# stat stamp so replacing a WAV takes effect on the next request.
+CONDITIONAL_CACHE_SIZE = max(1, int(os.environ.get("CHATTERBOX_CONDITIONAL_CACHE_SIZE", "8")))
 
 # Sentence boundary: a .!? followed by whitespace. Clause boundary (fallback for
 # a single sentence longer than the cap): comma / semicolon / colon / dash
@@ -190,6 +197,32 @@ def main():
         sys.exit(1)
 
     sample_rate = model.sr
+    # from_pretrained supplies the checkpoint's built-in voice. prepare_conditionals
+    # replaces model.conds, so retain this object explicitly; otherwise a later
+    # request with no reference WAV silently inherits whichever cloned voice
+    # happened to run most recently.
+    builtin_conditionals = model.conds
+    conditional_cache = OrderedDict()
+
+    def select_conditionals(reference_wav):
+        if not reference_wav:
+            if builtin_conditionals is None:
+                raise RuntimeError("Chatterbox checkpoint has no built-in voice conditionals")
+            model.conds = builtin_conditionals
+            return
+
+        resolved = Path(reference_wav).resolve()
+        stamp = resolved.stat()
+        key = (str(resolved), stamp.st_mtime_ns, stamp.st_size)
+        cached = conditional_cache.pop(key, None)
+        if cached is None:
+            log(f"preparing reference voice: {resolved.name}")
+            model.prepare_conditionals(str(resolved))
+            cached = model.conds
+        conditional_cache[key] = cached
+        while len(conditional_cache) > CONDITIONAL_CACHE_SIZE:
+            conditional_cache.popitem(last=False)
+        model.conds = cached
 
     def to_mono_f32(wav):
         """Reduce a generate() tensor [channels, samples] to a numpy float32
@@ -233,17 +266,16 @@ def main():
             # Chunk long input so Chatterbox never sees a block long enough to
             # drift (issue #1130), synthesise each chunk, and stitch. A short
             # line is a single chunk, so this is a no-op for the common case.
-            # Voice cloning is opt-in per request: passing audio_prompt_path
-            # clones the reference clip — the SAME clip on every chunk, so the
-            # cloned voice stays consistent across the stitch; omitting it uses
-            # the built-in voice.
+            # Select/cache the voice ONCE for the whole request. Every chunk then
+            # uses model.conds directly, avoiding a full reference-encoder pass
+            # per chunk while keeping the cloned voice consistent throughout.
+            # An empty reference explicitly restores the checkpoint built-in
+            # conditionals rather than inheriting the preceding cloned request.
+            select_conditionals(reference_wav)
             pieces = []
             gap = None
             for chunk in chunk_text(text):
-                if reference_wav:
-                    wav = model.generate(chunk, audio_prompt_path=reference_wav)
-                else:
-                    wav = model.generate(chunk)
+                wav = model.generate(chunk)
                 samples = to_mono_f32(wav)
                 if pieces:
                     if gap is None:

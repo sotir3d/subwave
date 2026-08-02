@@ -20,6 +20,13 @@ tools/echo-tts/voices/
 tools/echo-tts/models/
 tools/echo-tts/windows-ai.json
 
+# Windows-local Chatterbox Turbo runtime. The HTTP bridge and launch scripts
+# are committed; the venv, model cache, generated WAVs, and reference voices
+# stay machine-local.
+tools/chatterbox-turbo/.venv/
+tools/chatterbox-turbo/.runtime/
+tools/chatterbox-turbo/voices/
+
 # Next.js
 .next/
 out/

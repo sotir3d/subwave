@@ -42,7 +42,7 @@ start-echo-tts.bat
 
 The batch file launches only Echo-TTS and keeps its CMD window attached:
 
-- Physical CUDA device: `1`
+- Physical CUDA device: `0` (GPU 1 is left free for the Windows display)
 - Listen address: `0.0.0.0`
 - Port: `18765`
 - Health endpoint: `http://127.0.0.1:18765/health`
@@ -54,7 +54,7 @@ The CMD window shows model-loading, health, and synthesis logs. Press Ctrl+C to
 stop Echo. If Echo exits or startup fails, the batch file pauses so the error
 remains visible.
 
-Echo still needs roughly 8 GB free on physical GPU 1. If your GUI-launched LLM
+Echo still needs roughly 8 GB free on physical GPU 0. If your GUI-launched LLM
 uses both cards, configure its own GPU split so it leaves that headroom. The
 Echo launcher does not modify the LLM process or its allocation.
 

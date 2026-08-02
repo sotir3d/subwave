@@ -3,6 +3,7 @@
 // otherwise the admin-selected active persona — settings.getEffectivePersona).
 
 import * as settings from '../../../settings.js';
+import { hasFeature as remoteTtsHasFeature } from '../../../audio/remoteTts.js';
 import { resolveCloudModelForPersona } from '../speech/cloud-speech.js';
 import { isElevenLabsV3 } from '../core/pure.js';
 
@@ -51,7 +52,10 @@ export function djSystem(
     // string the DJ speaks as "broadcasting from {location}".
     location: settings.resolveOnAirLocation(s),
   }) + settings.onAirRosterClause(persona);
-  if (persona?.tts?.engine === 'chatterbox') return base + CHATTERBOX_TAG_HINT;
+  if (persona?.tts?.engine === 'chatterbox'
+      || (persona?.tts?.engine === 'remote' && remoteTtsHasFeature('paralinguistic-tags'))) {
+    return base + CHATTERBOX_TAG_HINT;
+  }
   // cloudModel is non-empty only when the persona actually resolves to a
   // configured cloud engine — including via the station defaultEngine when
   // the persona sets no engine of its own, which a persona-engine check here

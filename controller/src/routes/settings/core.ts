@@ -163,6 +163,11 @@ router.get('/settings', requireAdmin, async (req, res) => {
         pocketTtsVoices: settings.POCKET_TTS_VOICES,
         pocketTtsCustomVoices: customVoices,
         cloudProviders: settings.TTS_CLOUD_PROVIDERS,
+        // Provider-neutral remote bridges may publish their resident engine,
+        // voice catalogue and long-form/features contract. The UI remains a
+        // generic Remote surface; this is diagnostic/discovery metadata, not a
+        // second Chatterbox transport category.
+        remoteCapabilities: remoteTts.capabilities(),
         frequencies: settings.FREQUENCIES,
         // The live mood NAMES, for the show/festival mood dropdowns. Now driven
         // by the operator-editable vocabulary rather than the static default.

@@ -368,10 +368,19 @@ def dj_transition(a, b) =
   # edge, sequence the buffered outgoing tail and incoming source instead of
   # adding them together. No song is audible beneath speech, and no speech is
   # eaten by a music crossfade. Tiny edge fades remove clicks without overlap.
+  #
+  # Do NOT merge these two sources into one Liquidsoap track. merge=true keeps
+  # the outgoing song's track lifecycle alive across the first audible talk
+  # frames, so the post-cross metadata hook below does not publish the talk
+  # start until the old song finally closes. The result is exactly the broken
+  # on-air state this path exists to avoid: speech is audible while the player
+  # still names (and advances) the previous song. Keeping the boundary makes
+  # b's initial_metadata arrive on the first b frame while preserving the same
+  # non-overlapping audio sequence.
   talk_edge = a.metadata["subwave_kind"] == "talk" or b.metadata["subwave_kind"] == "talk"
   if talk_edge then
     log("Timeline talk edge: sequencing without overlap")
-    sequence(merge=true, [
+    sequence(merge=false, [
       fade.out(duration=0.15, initial_metadata=a.metadata, a.source),
       fade.in(duration=0.04, initial_metadata=b.metadata, b.source)
     ])

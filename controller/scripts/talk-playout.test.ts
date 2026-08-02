@@ -75,7 +75,12 @@ assert.equal(parseTalkMixerEpoch(JSON.stringify({ epoch: 'mixer-1', startedAt: 0
 // these invariants should fail fast in the normal controller test suite.
 const liq = readFileSync(resolve('..', 'liquidsoap', 'radio.liq'), 'utf8');
 assert.ok(liq.includes('talk_edge = a.metadata["subwave_kind"] == "talk"'), 'talk edges are detected in cross()');
-assert.ok(liq.includes('sequence(merge=true'), 'talk edges are sequenced, not mixed/ducked');
+assert.ok(liq.includes('sequence(merge=false'), 'talk edges are sequenced with a real lifecycle boundary');
+assert.ok(
+  !liq.slice(liq.indexOf('if talk_edge then'), liq.indexOf('else', liq.indexOf('if talk_edge then')))
+    .includes('sequence(merge=true'),
+  'talk transition must not merge speech into the outgoing song lifecycle',
+);
 assert.ok(liq.includes('talk_timeline_meta = music'), 'post-cross lifecycle observation exists');
 assert.ok(liq.includes('status = "started"') && liq.includes('status = "finished"'), 'both acknowledgements are emitted');
 assert.ok(

@@ -39,6 +39,7 @@ export interface RemoteTtsCapabilities {
   streaming?: boolean;
   maxSeconds?: number;
   voices?: string[];
+  features?: string[];
   [key: string]: unknown;
 }
 
@@ -53,10 +54,16 @@ function getUrl(): string {
 // Network/timeout/parse failures collapse to unavailable.
 async function probeOnce(): Promise<boolean> {
   const url = getUrl();
-  if (!url) return false;
+  if (!url) {
+    lastCapabilities = null;
+    return false;
+  }
   try {
     const res = await fetchWithTimeout(`${url}/health`, { timeoutMs: PROBE_TIMEOUT_MS, bodyDeadline: true });
-    if (!res.ok) return false;
+    if (!res.ok) {
+      lastCapabilities = null;
+      return false;
+    }
     const body = (await res.json()) as RemoteTtsCapabilities;
     const available = body.ok === true && body.ready !== false;
     lastCapabilities = available ? { ...body, ok: true } : null;
@@ -106,6 +113,19 @@ export async function refresh(): Promise<void> {
 // advertise the resident engine and its preferred acoustic-context limit.
 export function capabilities(): RemoteTtsCapabilities | null {
   return lastCapabilities ? { ...lastCapabilities } : null;
+}
+
+// Remote is intentionally provider-neutral, but a bridge may advertise
+// behavioural capabilities that affect script generation. This lets a remote
+// Chatterbox deployment retain the same paralinguistic-tag prompt support as
+// the in-container `chatterbox` engine without creating a duplicate transport
+// category or teaching the controller a Windows-only engine id.
+export function hasFeature(feature: string): boolean {
+  const wanted = feature.trim().toLowerCase();
+  const advertised = lastCapabilities?.features;
+  return !!wanted && Array.isArray(advertised) && advertised.some(
+    (candidate) => typeof candidate === 'string' && candidate.trim().toLowerCase() === wanted,
+  );
 }
 
 export function isAvailable(): boolean {
